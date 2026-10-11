@@ -166,7 +166,7 @@ def test_tools_choices_and_formats_as_chat_completion_fields():
     ({"tools": [{"type": "file_search", "vector_store_ids": ["v"]}]}, "tools of type 'file_search'"),
     ({"tool_choice": {"type": "web_search_preview"}}, "tool_choice must be"),
     ({"background": True}, "background responses"),
-    ({"include": ["reasoning.encrypted_content"]}, "include is not supported (reasoning.encrypted_content)"),
+    ({"include": ["file_search_call.result"]}, "include has no value 'file_search_call.result'"),
     ({"conversation": "conv_1"}, "conversations are not supported"),
     ({"prompt": {"id": "pmpt_1"}}, "prompt templates"),
     ({"truncation": "auto"}, "truncation"),

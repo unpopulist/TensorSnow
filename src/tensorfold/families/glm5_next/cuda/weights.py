@@ -1,11 +1,14 @@
-"""Load one rank of MLX affine 4-bit weights or EXL3 routed experts with BF16 elsewhere, preserving heads and quantization groups at split boundaries."""
+"""Load one rank of MLX affine 4-bit weights or an EXL3 checkpoint (routed experts EXL3; every other projection EXL3
+where the checkpoint stores a trellis, plain BF16/F16 otherwise), preserving heads and quantization groups at split
+boundaries."""
 
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Sequence
 
 import torch
 
@@ -13,19 +16,46 @@ from tensorfold.cuda import experts as grouped
 
 from tensorfold.cuda.exl3.experts import Exl3RoutedExperts as Exl3Experts
 from . import latent
-from .qmm import B16, Q4, as_i32, make_b16, make_q4, quantize4, stack_b16, stack_q4
+from .exl3_dense import SCRATCH, Stack, X3, x3 as make_x3
+from .qmm import B16, F8, Q4, as_i32, kvb_kind, make_b16, make_q4, quantize4, stack_b16, stack_q4
 
 PREFIX = "model.language_model."
 
 
 def bits_of(quant: dict) -> int:
-    """The checkpoint's one bit width; a mixed-bit encode (bits such as "mixed_k34_per_tensor") is refused by name."""
+    """MLX affine: the checkpoint's one bit width, a mixed-bit value refused by name. EXL3: informational only (every
+    tensor's width comes from its trellis shape), the config's whole-number average or 0 for anything else."""
 
     bits = quant.get("bits", 4)
-    if isinstance(bits, int) or (isinstance(bits, str) and bits.isdigit()):
+    whole = isinstance(bits, int) or (isinstance(bits, str) and bits.isdigit())
+    if str(quant.get("quant_method") or "").lower() == "exl3":
+        try:
+            return int(bits) if whole or float(bits).is_integer() else 0
+        except (TypeError, ValueError):
+            return 0                                     # "mixed", a list, ...: widths are per tensor anyway
+    if whole:
         return int(bits)
-    raise ValueError(f"this checkpoint's quantization bits are {bits!r}: GLM-5.3 on CUDA reads one bit width a "
-                     "checkpoint, so mixed-bit EXL3 encodes are not supported yet")
+    raise ValueError(f"this checkpoint's quantization bits are {bits!r}: GLM-5.3 on CUDA reads MLX affine weights "
+                     "of one bit width a checkpoint, so mixed-bit MLX encodes are not supported")
+
+
+def assistant_end(model_dir: str | Path) -> int | None:
+    """TF_GLM_ASSISTANT_ENDS=1: the id of GLM's ``<|assistant|>`` role token, which some reply formats emit to end a
+    turn even though the generation config leaves it out of the eos list; None when off or without that token.
+
+    GLM-5.3's chat template can produce ``<|assistant|>`` where a turn ends (e.g. between tool calls); the stock eos
+    is endoftext / ``<|user|>`` / ``<|observation|>`` only, so without this the engine would keep decoding past it."""
+
+    if os.environ.get("TF_GLM_ASSISTANT_ENDS", "").strip() not in ("1", "on", "true"):
+        return None
+    path = Path(model_dir) / "tokenizer.json"
+    if not path.is_file():
+        return None
+    try:
+        added = json.loads(path.read_text()).get("added_tokens", [])
+    except (OSError, ValueError):
+        return None
+    return next((int(t["id"]) for t in added if t.get("content") == "<|assistant|>"), None)
 
 
 @dataclass
@@ -64,7 +94,8 @@ class Config:
     mtp_layers: int
     group_size: int
     bits: int
-    quant: str = "mlx"         # "mlx" (affine 4-bit everywhere) or "exl3" (EXL3 routed experts, BF16 elsewhere)
+    quant: str = "mlx"         # "mlx" (affine 4-bit everywhere) or "exl3" (EXL3 trellises, plain tensors elsewhere)
+    codebook: str = ""         # EXL3: config.json's codebook ("mcg", "mul1"), the fallback for a tensor with no marker
 
     @classmethod
     def read(cls, model_dir: str | Path) -> "Config":
@@ -79,6 +110,9 @@ class Config:
         quant = raw.get("quantization") or raw.get("quantization_config") or {}
         eos = t.get("eos_token_id", raw.get("eos_token_id"))
         eos = tuple(int(e) for e in eos) if isinstance(eos, list) else (int(eos),)
+        end = assistant_end(model_dir)                       # TF_GLM_ASSISTANT_ENDS=1: add <|assistant|> to the eos
+        if end is not None and end not in eos:
+            eos = eos + (end,)
         n = int(t["num_hidden_layers"])
         kinds = ["kda" if k == "linear_attention" else "dsa" for k in t["layer_types"]]
         dense = int(t.get("first_k_dense_replace", 3))
@@ -103,6 +137,7 @@ class Config:
             limit=float(t.get("swiglu_limit", 10.0)), kinds=kinds, mlp_kinds=mlp_kinds, eos=eos,
             mtp_layers=int(t.get("num_nextn_predict_layers", 0)), group_size=int(quant.get("group_size", 64)),
             bits=bits_of(quant), quant=str(quant.get("quant_method") or "mlx").lower(),
+            codebook=str(quant.get("codebook") or "").lower(),
         )
 
     @property
@@ -121,14 +156,14 @@ class HCW:
 
 @dataclass
 class KDAW:
-    proj: Q4                  # [q | k | v | f_a | g_a | b]
+    proj: Q4 | B16 | Stack    # [q | k | v | f_a | g_a | b]; EXL3 fused qkv: Stack[X3 [q_r|k_r|v_r], B16 [f_a|g_a|b_r]]
     fb: Q4
     gb: Q4
     conv: torch.Tensor        # [3 HL 128, taps] bf16
     a_log: torch.Tensor       # [HL] fp32
     dt_bias: torch.Tensor     # [HL 128] fp32
     norm: torch.Tensor        # [128] bf16
-    o: Q4
+    o: Q4 | B16 | X3
     heads: int
 
     @property
@@ -158,22 +193,22 @@ class IndexW:
 
 @dataclass
 class DSAW:
-    proj: Q4                  # [q_a | kv_a]
+    proj: Q4 | B16 | Stack    # [q_a | kv_a]; EXL3: Stack[X3 q_a, X3 kv_a] (own widths and scales)
     q_norm: torch.Tensor
     kv_norm: torch.Tensor
-    q_b: Q4
-    kv_k: Q4                  # key rows of kv_b for the local heads
-    kv_v: Q4                  # value rows
-    o: Q4
+    q_b: Q4 | B16 | X3
+    kv_k: Q4 | B16 | None     # key rows of kv_b for the local heads (TF_GLM_LATENT=0 only)
+    kv_v: Q4 | B16 | None     # value rows (TF_GLM_LATENT=0 only)
+    o: Q4 | B16 | X3
     heads: int
     index: IndexW | None = None
-    absorb: object = None     # latent.AbsorbW: kv_b split per head, for attention on the latent cache
+    absorb: object = None     # latent.AbsorbW / AbsorbF8 / AbsorbQ4: kv_b split per head, for the latent cache
 
 
 @dataclass
 class MLPW:
-    gu: Q4                    # [gate | up]
-    down: Q4
+    gu: Q4 | B16 | Stack      # [gate | up]; EXL3: Stack[X3 gate, X3 up]
+    down: Q4 | B16 | X3
     width: int
 
 
@@ -182,7 +217,7 @@ class MoEW:
     router: torch.Tensor      # [E, D] bf16
     bias: torch.Tensor        # [E] fp32
     experts: grouped.Experts | Exl3Experts  # 4-bit: E + 1 (shared expert last); EXL3: the E routed experts
-    shared: MLPW | None = None            # EXL3 checkpoints: the shared expert (BF16)
+    shared: MLPW | None = None            # EXL3 checkpoints: the shared expert (EXL3 or BF16, as stored)
 
 
 @dataclass
@@ -203,7 +238,7 @@ class LayerW:
 class MTPW:
     enorm: torch.Tensor
     hnorm: torch.Tensor
-    eh: Q4                    # [D, 2D]: input [embedding | hidden]
+    eh: Q4 | B16 | X3         # [D, 2D]: input [embedding | hidden]
     norm: torch.Tensor        # shared_head.norm
     layer: LayerW             # DSA + MoE, plain residual (no hyper-connections)
 
@@ -214,14 +249,14 @@ class Weights:
     embed: tuple[torch.Tensor, torch.Tensor, torch.Tensor]
     layers: list[LayerW]
     norm: torch.Tensor
-    head: Q4 | B16
+    head: Q4 | B16 | X3       # this rank's vocabulary columns [vocab_offset, vocab_offset + head.n)
     mtp: MTPW | None
     rank: int
     world: int
     device: torch.device
     comm: Any = None
     meta: dict = field(default_factory=dict)
-    draft_head: Q4 | None = None      # BF16 heads: a 4-bit copy the draft steps read (drafts only propose)
+    draft_head: Q4 | None = None      # BF16 heads: a 4-bit copy the draft steps read (drafts only propose); EXL3 heads: None
 
     @property
     def vocab_offset(self) -> int:
@@ -236,7 +271,14 @@ class Weights:
             if isinstance(t, torch.Tensor) and t.data_ptr() not in seen:
                 seen.add(t.data_ptr())
                 total += t.numel() * t.element_size()
-            elif isinstance(t, (Q4, B16, grouped.Experts, Exl3Experts, HCW, KDAW, DSAW, MLPW, MoEW, LayerW, MTPW, IndexW)):
+            elif isinstance(t, X3):                      # the trellis words, scales and split-K semaphores
+                lin = t.lin
+                for v in (lin.words, lin.suh, lin.svh, lin.bias, getattr(lin, "_counters", None)):
+                    add(v)
+            elif isinstance(t, Stack):
+                add(t.parts)
+            elif isinstance(t, (Q4, B16, F8, grouped.Experts, Exl3Experts, HCW, KDAW, DSAW, MLPW, MoEW, LayerW, MTPW,
+                                IndexW, latent.AbsorbW, latent.AbsorbQ4, latent.AbsorbF8)):
                 for v in vars(t).values():
                     add(v)
             elif isinstance(t, (list, tuple)):
@@ -252,11 +294,16 @@ class Weights:
         add(self.head)
         add(self.draft_head)
         add(self.mtp)
+        if self.cfg.quant == "exl3":
+            total += SCRATCH.nbytes()                    # the EXL3 matrices' shared decode / prompt scratch
         return total
 
 
-def load(model_dir: str | Path, *, rank: int, device: str = "cuda", mtp: bool = True, world: int = 2) -> Weights:
-    """One of world ranks from a checkpoint or rank folder, MTP included unless mtp is False."""
+def load(model_dir: str | Path, *, rank: int, device: str = "cuda", mtp: bool = True, world: int = 2,
+         layers: Sequence[int] | None = None) -> Weights:
+    """One of world ranks from a checkpoint or rank folder, MTP included unless mtp is False.
+
+    ``layers``: only these decoder layers (tests: a few layers of a large checkpoint); the engine loads them all."""
 
     from .split import RankReader
 
@@ -264,6 +311,7 @@ def load(model_dir: str | Path, *, rank: int, device: str = "cuda", mtp: bool = 
     if cfg.quant not in ("mlx", "exl3"):
         raise ValueError(f"GLM-5.3-Flash's CUDA engine reads MLX 4-bit or EXL3 checkpoints, not {cfg.quant}")
     exl3 = cfg.quant == "exl3"
+    kvb = kvb_kind() if exl3 else "bf16"         # TF_GLM_KVB; an MLX checkpoint's kv_b is 4-bit as stored
     dev = torch.device(device)
     rd = RankReader(model_dir, rank, ranks=world)
     HL = cfg.heads // world
@@ -278,13 +326,55 @@ def load(model_dir: str | Path, *, rank: int, device: str = "cuda", mtp: bool = 
     def trip(name: str) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         return (as_i32(t(name + ".weight")), t(name + ".scales"), t(name + ".biases"))
 
-    def q4(name: str) -> Q4 | B16:
+    def has(full: str) -> bool:
+        return full in rd.index
+
+    def book(full: str) -> str:
+        """An EXL3 group's codebook: its marker tensor (``.mul1`` / ``.mcg``), else config.json's, else ExLlamaV3's
+        default. Only the marker's name matters: its value is the codebook's constant."""
+
+        for cb in ("mul1", "mcg"):
+            if has(f"{full}.{cb}"):
+                return cb
+        return cfg.codebook or "3inst"
+
+    def is3(name: str) -> bool:
+        """The checkpoint stores this projection as an EXL3 trellis (RED-SNOW's dense layers; never Mia's TR3)."""
+
+        return exl3 and has(PREFIX + name + ".trellis")
+
+    def lin3(full: str) -> X3:
+        """An EXL3 projection, this rank's piece as split.py cuts it (output split: trellis tile columns + svh;
+        input split: tile rows + suh; fused qkv: [q_r | k_r | v_r]). Each width comes from its trellis shape."""
+
+        tr, suh, svh = (rd.get(f"{full}.{x}").to(dev).contiguous() for x in ("trellis", "suh", "svh"))
+        return make_x3(tr, suh, svh, book(full), device=dev)
+
+    def q4(name: str) -> Q4 | B16 | X3:
+        if is3(name):
+            return lin3(PREFIX + name)
         return make_b16(t(name + ".weight")) if exl3 else make_q4(*trip(name))
 
-    def stack(names: list[str]) -> Q4 | B16:
-        if exl3:
+    def stack(names: list[str]) -> Q4 | B16 | Stack:
+        """Projections of one input side by side: one stacked B16 / Q4, or with EXL3 parts (each its own scales,
+        so they cannot share a trellis) a ``Stack`` of X3s and stacked runs of plain neighbours."""
+
+        if not exl3:
+            return stack_q4([trip(n) for n in names])
+        if not any(is3(n) for n in names):
             return stack_b16([t(n + ".weight") for n in names])
-        return stack_q4([trip(n) for n in names])
+        parts, plain = [], []
+        for n in names:
+            if is3(n):
+                if plain:
+                    parts.append(stack_b16(plain))
+                    plain = []
+                parts.append(lin3(PREFIX + n))
+            else:
+                plain.append(t(n + ".weight"))
+        if plain:
+            parts.append(stack_b16(plain))
+        return Stack(parts)
 
     def hc(i: int, site: str) -> HCW:
         return HCW(t(f"layers.{i}.hc_{site}_fn").contiguous(), t(f"layers.{i}.hc_{site}_base", torch.float32),
@@ -292,8 +382,19 @@ def load(model_dir: str | Path, *, rank: int, device: str = "cuda", mtp: bool = 
 
     def kda(i: int) -> KDAW:
         p = f"layers.{i}.self_attn."
-        proj = stack([p + "q_proj", p + "k_proj", p + "v_proj", p + "f_a_proj", p + "g_a_proj", p + "b_proj"])
-        conv = torch.cat([t(p + f"{x}_conv1d.weight") for x in "qkv"]).reshape(3 * LL * 128, cfg.conv).contiguous()
+        if is3(p + "qkv_proj"):
+            # q/k/v fused before quantization (RED-SNOW): one trellis whose rank piece is [q_r | k_r | v_r]
+            # (split.py fused3), then the plain f_a / g_a / b_r rows in the same columns of p as the stacked form
+            qkv = lin3(PREFIX + p + "qkv_proj")
+            if qkv.n != 3 * LL * 128:
+                raise ValueError(f"layer {i} qkv_proj gives this rank {qkv.n} columns, not 3 x {LL} heads x 128")
+            proj = Stack([qkv, stack_b16([t(p + x + ".weight") for x in ("f_a_proj", "g_a_proj", "b_proj")])])
+        else:
+            proj = stack([p + "q_proj", p + "k_proj", p + "v_proj", p + "f_a_proj", p + "g_a_proj", p + "b_proj"])
+        if has(PREFIX + p + "conv1d.weight"):    # fused [q; k; v] channels, this rank's [q_r | k_r | v_r] rows
+            conv = t(p + "conv1d.weight").reshape(3 * LL * 128, cfg.conv).contiguous()
+        else:
+            conv = torch.cat([t(p + f"{x}_conv1d.weight") for x in "qkv"]).reshape(3 * LL * 128, cfg.conv).contiguous()
         return KDAW(proj, q4(p + "f_b_proj"), q4(p + "g_b_proj"), conv, t(p + "A_log", torch.float32).contiguous(),
                     t(p + "dt_bias", torch.float32).contiguous(), t(p + "o_norm.weight"), q4(p + "o_proj"), LL)
 
@@ -302,18 +403,22 @@ def load(model_dir: str | Path, *, rank: int, device: str = "cuda", mtp: bool = 
         proj = stack([p + "q_a_proj", p + "kv_a_proj_with_mqa"])
         rows = torch.arange(HL * 512, device=dev).view(HL, 512)
         krows, vrows = rows[:, :cfg.qk_dim].reshape(-1), rows[:, cfg.qk_dim:].reshape(-1)
+        # the latent path reads kv_b only through ``absorb``: the per-head key and value matrices (kv_k, kv_v) exist
+        # only without it (TF_GLM_LATENT=0), so they take no memory beside it (Mia's 0013)
+        kv_k = kv_v = None
         if exl3:
-            w = t(p + "kv_b_proj.weight")
-            kv_k, kv_v = make_b16(w[krows]), make_b16(w[vrows])
-            full_k, full_v = (lambda: w[krows].float()), (lambda: w[vrows].float())
+            w = t(p + "kv_b_proj.weight")             # RED-SNOW: F16 as stored
+            if not latent.ENABLED:
+                kv_k, kv_v = make_b16(w[krows]), make_b16(w[vrows])
         else:
             w, s, b = trip(p + "kv_b_proj")
-            kv_k = make_q4(w[krows], s[krows], b[krows])
-            kv_v = make_q4(w[vrows], s[vrows], b[vrows])
+            if not latent.ENABLED:
+                kv_k = make_q4(w[krows], s[krows], b[krows])
+                kv_v = make_q4(w[vrows], s[vrows], b[vrows])
         if not latent.ENABLED:
             absorb = None
-        elif exl3:
-            absorb = latent.AbsorbW.from_rows(full_k(), full_v(), HL)
+        elif exl3:                        # TF_GLM_KVB: bf16 (as stored), or fp8 / q4 (lossy, half / quarter the bytes)
+            absorb = latent.from_bf16(w[krows], w[vrows], HL, kvb)
         elif cfg.group_size == 64:        # the checkpoint's own 4-bit rows, read as they are stored
             absorb = latent.AbsorbQ4((w[krows], s[krows], b[krows]), (w[vrows], s[vrows], b[vrows]), HL)
         else:
@@ -366,7 +471,7 @@ def load(model_dir: str | Path, *, rank: int, device: str = "cuda", mtp: bool = 
             [(rd.get(PREFIX + p + f"experts.{e}.down_proj.trellis").to(dev),
               rd.get(PREFIX + p + f"experts.{e}.down_proj.suh").to(dev),
               rd.get(PREFIX + p + f"experts.{e}.down_proj.svh").to(dev)) for e in range(cfg.experts)],
-            "mcg", device=dev)
+            book(PREFIX + p + "experts.0.gate_proj"), device=dev)
         return gate
 
     def moe(i: int) -> MoEW:
@@ -393,14 +498,17 @@ def load(model_dir: str | Path, *, rank: int, device: str = "cuda", mtp: bool = 
 
     layer_events: list = []                              # each layer's event, recorded once its work is queued
 
-    def layer(i: int, plain: bool = False) -> LayerW:
+    def layer(i: int, plain: bool = False, nxt: int | None = None) -> LayerW:
+        """Layer ``i`` (``plain``: the MTP layer); ``nxt``: the layer loaded after it (default i + 1), whose experts
+        are read ahead."""
+
         kind = "dsa" if plain else cfg.kinds[i]
         mk = "moe" if plain else cfg.mlp_kinds[i]
         if len(layer_events) >= 2:                       # at most two layers queued ahead of the GPU
             layer_events.pop(0).synchronize()
         up = None if exl3 else dev                       # MLX experts come uploaded (EXL3's are unpacked on the host)
         rd.prefetch(expert_names(i), up)                 # already queued, except for the first layer
-        rd.prefetch(expert_names(i + 1), up)             # two layers in flight: reads overlap copies and packing
+        rd.prefetch(expert_names(i + 1 if nxt is None else nxt), up)   # two layers in flight: reads overlap copies
         lw = LayerW(i, kind, None if plain else hc(i, "attn"), None if plain else hc(i, "ffn"),
                     t(f"layers.{i}.input_layernorm.weight"), t(f"layers.{i}.post_attention_layernorm.weight"))
         if kind == "kda":
@@ -422,11 +530,20 @@ def load(model_dir: str | Path, *, rank: int, device: str = "cuda", mtp: bool = 
         embed = (as_i32(rd.get(PREFIX + "embed_tokens.weight")).to(dev), rd.get(PREFIX + "embed_tokens.scales").to(dev),
                  rd.get(PREFIX + "embed_tokens.biases").to(dev))
     try:                                          # a failed load still cancels the reads queued ahead
-        which = list(range(cfg.layers))
-        built = [layer(i) for i in which]
+        which = list(range(cfg.layers)) if layers is None else sorted(set(int(i) for i in layers))
+        if which and not 0 <= which[0] <= which[-1] < cfg.layers:
+            raise ValueError(f"layers {which}: this checkpoint has decoder layers 0..{cfg.layers - 1}")
+        built = [layer(i, nxt=which[j + 1] if j + 1 < len(which) else cfg.layers) for j, i in enumerate(which)]
         vl = cfg.vocab // world
         draft_head = None
-        if exl3:
+        if exl3 and has("lm_head.trellis"):
+            # RED-SNOW: the 8-bit EXL3 head, split by vocabulary tile columns (split.py), so this rank holds columns
+            # [rank * vl, (rank + 1) * vl), which vocab_offset names. No BF16 head exists to quantize a draft copy
+            # from: MTP and DFlash2 drafts read this head (decode kernel; prompt chunks take its 128-row pieces).
+            head = lin3("lm_head")
+            if head.n != vl or head.k != cfg.hidden:
+                raise ValueError(f"lm_head gives this rank [{head.k} -> {head.n}], not [{cfg.hidden} -> {vl}]")
+        elif exl3:
             head = make_b16(rd.get("lm_head.weight")[rank * vl:(rank + 1) * vl].to(dev))
             # Draft steps use the quantized head; verification keeps the original head.
             draft_head = quantize4(head.weight)
@@ -443,5 +560,30 @@ def load(model_dir: str | Path, *, rank: int, device: str = "cuda", mtp: bool = 
         w.meta.update(layers=which)
     finally:
         rd.close()
+    if exl3:
+        # the EXL3 matrices' decode scratch at its largest (128 rows), so a captured CUDA graph never grows it
+        SCRATCH.reserve(exl3_users(w), dev)
     torch.cuda.empty_cache()
     return w
+
+
+def exl3_users(w: Weights) -> list[X3 | Stack]:
+    """Every EXL3 matrix object (``X3`` / ``Stack``) the main model, the MTP layer and the head multiply by."""
+
+    found: list = []
+
+    def walk(o) -> None:
+        if isinstance(o, (X3, Stack)):
+            found.append(o)
+        elif isinstance(o, (KDAW, DSAW, MLPW, MoEW, LayerW, MTPW)):
+            for v in vars(o).values():
+                walk(v)
+        elif isinstance(o, (list, tuple)):
+            for v in o:
+                walk(v)
+
+    walk(w.layers)
+    walk(w.mtp)
+    walk(w.head)
+    walk(w.draft_head)
+    return found

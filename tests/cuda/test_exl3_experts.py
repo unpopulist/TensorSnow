@@ -308,13 +308,14 @@ def test_graph_replay_equals_eager_at_1_2_4_8_rows():
 
 
 @pytest.mark.parametrize("slots", (1, 7, 9, 32))
-def test_fused_down_and_combine_equal_the_separate_launches(slots):
+def test_fused_down_and_combine_equal_the_separate_launches(slots, monkeypatch):
     """routed() finishes with one launch (down_combine) where it used to run down_epilogue then combine: the
     per-slot outputs and the combined rows are bit-identical to the two launches, with a non-routed slot whose
     output the caller left in y, 1 to 16 rows and 1 to 32 slots."""
 
     from tensorfold.cuda.exl3 import experts
 
+    monkeypatch.setattr(experts, "PROMPT_ROWS", 1 << 30)    # the decode kernels, whose Z the check below reads
     E, D, I = 40, 512, 256
     _, cb, kfun = MIXED[1]
     ex, _ = _layer(E, D, I, [kfun(e) for e in range(E)], cb, seed=31)
@@ -385,3 +386,86 @@ def test_lane_map_extracts_every_window():
                         off = end(p_last, k2) - end(p, k2)
                         assert off + 16 <= 64, (k2, lane, g, j, off)
                         assert (mm >> off) & 0xFFFF == state(p), (k2, lane, g, j)
+
+
+PROMPT_WIDTHS = [
+    ("mul1-redsnow", 2, lambda e: ((10, 12, 8)[e % 3],) * 2 + ((8, 8, 12)[e % 3],)),         # RED-SNOW's 5/6/4-bit mix
+    ("mul1-wide", 2, lambda e: ((2, 3, 5, 7, 9, 11, 13, 16)[e % 8], (16, 4, 6, 8)[e % 4], (3, 8, 15, 16)[e % 4])),
+    ("mcg", 1, lambda e: ((4, 6, 8, 16)[e % 4],) * 2 + ((8, 6)[e % 2],)),
+    ("3inst", 0, lambda e: ((8, 6, 14)[e % 3],) * 2 + ((8, 16)[e % 2],)),
+]
+
+
+@pytest.mark.parametrize("name,cb,kfun", PROMPT_WIDTHS, ids=[p[0] for p in PROMPT_WIDTHS])
+@pytest.mark.parametrize("pass_rows", (16, 32))
+def test_prompt_kernel_equals_the_decode_kernel_bit_for_bit(name, cb, kfun, pass_rows, monkeypatch):
+    """Windows of PROMPT_ROWS or more take the Y^T = W^T X^T prompt kernel: every slot's Y (and the weighted sum) has
+    the decode kernel's bits, so a row never depends on its window, whichever kernel served it."""
+
+    from tensorfold.cuda.exl3 import experts
+
+    E, D, I, TOPK, ROWS = 24, 1024, 512, 6, 96          # GLM tile settings: gate/up chains of 4 k tiles, down of 8
+    ex, _ = _layer(E, D, I, [kfun(e) for e in range(E)], cb, seed=29 + cb)
+    g = torch.Generator().manual_seed(5)
+    x = torch.randn((ROWS, D), generator=g).to(torch.bfloat16).cuda()
+    sel, w = _picks(E, ROWS, TOPK, g, shared=True)
+    sel[:40, :TOPK] = sel[0, :TOPK]                     # one expert set shared by 40 rows: passes of several members
+    monkeypatch.setattr(experts, "PROMPT_PASS", pass_rows)
+    monkeypatch.setattr(experts, "PROMPT_ROWS", 1 << 30)
+    big = experts.Scratch(ex, ROWS, TOPK + 1)
+    one = experts.Scratch(ex, ROWS, TOPK + 1)
+    monkeypatch.setattr(experts, "PROMPT_ROWS", 32)
+    small = experts.Scratch(ex, ROWS, TOPK + 1)         # z sized for the decode windows only
+    assert experts.prompt_fits(small, D, I)
+    assert small.z.numel() < big.z.numel()
+    for act in (experts.ACT_BF16, experts.ACT_F32):
+        for order in (0, 1):
+            monkeypatch.setattr(experts, "PROMPT_ORDER", order)
+            monkeypatch.setattr(experts, "PROMPT_ROWS", 32)
+            y_p = experts.routed(x, sel, None, ex, small, None, ROWS, act_mode=act).clone()
+            out_p = experts.routed(x, sel, w, ex, small, None, ROWS, act_mode=act).clone()
+            monkeypatch.setattr(experts, "PROMPT_ROWS", 1 << 30)
+            y_d = experts.routed(x, sel, None, ex, big, None, ROWS, act_mode=act).clone()
+            out_d = experts.routed(x, sel, w, ex, big, None, ROWS, act_mode=act).clone()
+            live = (sel < E).view(-1)
+            assert torch.equal(y_p[live], y_d[live]), (name, act, order)
+            assert torch.equal(out_p, out_d), (name, act, order)
+            for r in (0, 39, 40, ROWS - 1):                # and the one-row decode window
+                y1 = experts.routed(x[r:r + 1], sel[r:r + 1].contiguous(), None, ex, one, None, 1, act_mode=act)
+                assert torch.equal(y1[:TOPK], y_p.view(ROWS, TOPK + 1, D)[r, :TOPK]), (name, act, r)
+
+
+def test_split_grouping_equals_the_one_block_grouping():
+    from tensorfold.cuda.exl3 import experts
+
+    ext = experts._ext()
+    g = torch.Generator().manual_seed(9)
+    E, R, slots = 288, 300, 9
+    pick = torch.randint(0, E + 1, (R, slots), generator=g, dtype=torch.int32).cuda()
+    res = []
+    for split in (False, True):
+        ids = torch.zeros((E,), dtype=torch.int32, device="cuda")
+        cnt = torch.zeros((1,), dtype=torch.int32, device="cuda")
+        mem = torch.full((E, R), 7, dtype=torch.int32, device="cuda")
+        ext.group(pick, ids, cnt, mem, R, slots, E, split)
+        res.append((ids.clone(), cnt.clone(), mem.clone()))
+    n = int(res[0][1])
+    assert int(res[1][1]) == n
+    assert torch.equal(res[0][0][:n], res[1][0][:n]) and torch.equal(res[0][2][:n], res[1][2][:n])
+
+
+def test_fused_down_epilogue_equals_the_separate_launch(monkeypatch):
+    from tensorfold.cuda.exl3 import experts
+
+    E, D, I, TOPK, ROWS = 16, 1024, 512, 4, 8
+    ex, _ = _layer(E, D, I, [(10, 12, (8, 12)[e % 2]) for e in range(E)], 2, seed=3)
+    g = torch.Generator().manual_seed(1)
+    x = torch.randn((ROWS, D), generator=g).to(torch.bfloat16).cuda()
+    sel, _ = _picks(E, ROWS, TOPK, g, shared=True)
+    s = experts.Scratch(ex, ROWS, TOPK + 1)
+    ys = []
+    for fuse in (False, True):
+        monkeypatch.setattr(experts, "FUSE_DOWN", fuse)
+        ys.append(experts.routed(x, sel, None, ex, s, None, ROWS, act_mode=experts.ACT_BF16).clone())
+    live = (sel < E).view(-1)
+    assert torch.equal(ys[0][live], ys[1][live])

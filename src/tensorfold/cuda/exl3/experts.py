@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import os
 from dataclasses import dataclass, field
 from functools import lru_cache
 from pathlib import Path
@@ -18,6 +19,20 @@ K2_SUPPORTED = tuple(range(2, 17))
 # (n tiles a block, warps, K splits, tiles in flight): GLM's settings, whose arithmetic order this keeps bit for bit
 GLM_GATEUP = (8, 4, 4, 1)
 GLM_DOWN = (8, 4, 1, 1)
+# Windows of at least PROMPT_ROWS rows take the prompt kernel (Y^T = W^T X^T, passes of PROMPT_PASS members an expert):
+# the same chains and sums as the decode kernel, so the same bits; only the speed depends on the choice.
+PROMPT_ROWS = int(os.environ.get("TF_EXL3_PROMPT_ROWS", "8"))
+PROMPT_PASS = int(os.environ.get("TF_EXL3_PROMPT_PASS", "32"))
+PROMPT_ORDER = int(os.environ.get("TF_EXL3_PROMPT_ORDER", "1"))   # 1: heavy/light passes interleaved
+FUSE_DOWN = os.environ.get("TF_EXL3_FUSE_DOWN", "1") != "0"   # decode windows: down epilogue in the kernel
+# windows from this many rows build the member lists by one block an expert (members_kernel), a speed choice only
+# (the same lists): the one-block lists cost ~2 us a row (3 us at 1 row, 10 at 4, 17 at 8, 33 at 16 on GB10), the
+# split ones ~3.3 us at 1-16 rows
+GROUP_SPLIT_ROWS = 2
+PROMPT_KTS = int(os.environ.get("TF_EXL3_PROMPT_KTS", "8"))   # most k tiles a shared-memory stage
+# The decode kernel's trellis loads (the same words, chains and sums either way, so the same bits): "nc" (default)
+# 16-byte ld.global.nc pieces of a k tile through shared memory, "32" the 32-bit __ldg of word ``lane`` of each tile.
+LOADS = {"nc": 1, "1": 1, "32": 0, "0": 0}[os.environ.get("TF_EXL3_LOADS", "nc").strip().lower() or "nc"]
 
 
 @lru_cache(maxsize=1)
@@ -25,8 +40,9 @@ def _ext():
     from tensorfold.cuda.build import load
 
     here = Path(__file__).parent
-    srcs = [str(here / f) for f in ("experts.cpp", "experts.cu", "experts_cb0.cu", "experts_cb1.cu", "experts_cb2.cu")]
-    return load(name="tensorfold_exl3_experts_v1", sources=srcs, extra_cuda_cflags=["-O3", "-lineinfo"],
+    srcs = [str(here / f) for f in ("experts.cpp", "experts.cu", "experts_cb0.cu", "experts_cb1.cu", "experts_cb2.cu",
+                                    "experts_pcb0.cu", "experts_pcb1.cu", "experts_pcb2.cu")]
+    return load(name="tensorfold_exl3_experts_v3", sources=srcs, extra_cuda_cflags=["-O3", "-lineinfo"],
                 verbose=False)
 
 
@@ -74,6 +90,7 @@ class Exl3RoutedExperts:
     k2_gu: tuple[int, int]    # (min, max) K2 over gate and up
     k2_d: tuple[int, int]
     trellis_bytes: torch.Tensor   # int64 [E], gate + up + down trellis bytes of each expert (for GB/s)
+    aligned16: bool = True        # every trellis 16-byte aligned (the 16-byte load path needs it)
     keep: list = field(default_factory=list, repr=False)
 
     def nbytes_read(self, ids: Sequence[int]) -> int:
@@ -107,6 +124,7 @@ def prepare(gate: Sequence[tuple], up: Sequence[tuple], down: Sequence[tuple], c
     gp, gk, gks = table(gate, D, I)
     upp, uk, uks = table(up, D, I)
     dp, dk, dks = table(down, I, D)
+    aligned16 = all(t.data_ptr() % 16 == 0 for t in keep)
 
     def stack(mats, j, n):
         out = torch.empty((E, n), dtype=torch.float16, device=device)
@@ -117,7 +135,7 @@ def prepare(gate: Sequence[tuple], up: Sequence[tuple], down: Sequence[tuple], c
     tb = torch.tensor([(D * I // 256) * (gks[e] + uks[e] + dks[e]) * 16 for e in range(E)], dtype=torch.int64)
     return Exl3RoutedExperts(gp, upp, dp, gk, uk, dk, stack(gate, 1, D), stack(up, 1, D), stack(gate, 2, I),
                              stack(up, 2, I), stack(down, 1, I), stack(down, 2, D), E, D, I, cb,
-                             (min(gks + uks), max(gks + uks)), (min(dks), max(dks)), tb, keep)
+                             (min(gks + uks), max(gks + uks)), (min(dks), max(dks)), tb, aligned16, keep)
 
 
 def prepare_stacked(gt: torch.Tensor, ut: torch.Tensor, dt: torch.Tensor, suh_g, suh_u, svh_g, svh_u, suh_d, svh_d,
@@ -146,22 +164,32 @@ def default_config(K: int, N: int, gateup: bool) -> tuple[int, int, int, int]:
 class Scratch:
     """Buffers for up to ``rows`` rows of ``slots`` slots; slots whose pick is not a routed expert are left to the caller."""
 
-    def __init__(self, ex: Exl3RoutedExperts, rows: int, slots: int, cfg_gu=None, cfg_d=None, device="cuda") -> None:
+    def __init__(self, ex: Exl3RoutedExperts, rows: int, slots: int, cfg_gu=None, cfg_d=None, device="cuda",
+                 prompt_rows: int | None = None) -> None:
+        """``prompt_rows``: windows from this many rows take the prompt kernel (default PROMPT_ROWS; the same bits
+        either way, only the speed and the size of ``z`` depend on it)."""
+
         D, I = ex.dims, ex.width
+        self.prompt_rows = PROMPT_ROWS if prompt_rows is None else int(prompt_rows)
         self.cfg_gu = cfg_gu or default_config(D, I, True)
         self.cfg_d = cfg_d or default_config(I, D, False)
         P = rows * slots
         self.xg = torch.zeros((P, D), dtype=torch.float16, device=device)
         self.xu = torch.zeros((P, D), dtype=torch.float16, device=device)
         self.xd = torch.zeros((P, I), dtype=torch.float16, device=device)
-        # gate and up write 2 * splits * P * I partials, down splits * P * D
-        self.z = torch.zeros((max(2 * self.cfg_gu[2] * I, self.cfg_d[2] * D) * P,), dtype=torch.float32, device=device)
+        # gate and up write 2 * splits * P * I partials, down splits * P * D; only windows below prompt_rows use them
+        # when the prompt kernel serves the rest
+        zp = min(P, (self.prompt_rows - 1) * slots) if prompt_fits(self, D, I) else P
+        self.z = torch.zeros((max(2 * self.cfg_gu[2] * I, self.cfg_d[2] * D) * zp,), dtype=torch.float32, device=device)
         self.y = torch.zeros((P, D), dtype=torch.float32, device=device)
         maxu = min(P, ex.count)
         self.ids = torch.zeros((maxu,), dtype=torch.int32, device=device)
         self.count = torch.zeros((1,), dtype=torch.int32, device=device)
         self.members_buf = torch.full((maxu * rows,), -1, dtype=torch.int32, device=device)
         self.rows, self.slots, self.count_experts = rows, slots, ex.count
+        # prompt windows: (u, pass) items, at most one partial pass an expert plus P / pass full ones
+        self.items = torch.zeros((maxu + P // PROMPT_PASS + 1, 2), dtype=torch.int32, device=device)
+        self.nitems = torch.zeros((1,), dtype=torch.int32, device=device)
 
     def window(self, R: int):
         """(ids, members) sized for R rows: the grids only span what R rows can use."""
@@ -183,23 +211,61 @@ def routed(x: torch.Tensor, pick: torch.Tensor, wts: torch.Tensor | None, ex: Ex
         raise ValueError(f"{R} rows but the scratch holds {s.rows}")
     ids, members = s.window(R)
     if group:
-        ext.group(pick, ids, s.count, members, R, slots, E)
+        ext.group(pick, ids, s.count, members, R, slots, E, R >= GROUP_SPLIT_ROWS)
     ext.rot_in(x, x.stride(0), pick, ex.suh_g, ex.suh_u, s.xg, s.xu, R, D, slots, E)
+    if R >= s.prompt_rows and prompt_fits(s, D, I):
+        # the decode kernel's chains and sums with each decoded tile feeding a pass of members: the same bits
+        ext.prompt_items(s.count, members, s.items, s.nitems, PROMPT_PASS, PROMPT_ORDER)
+        nt, w, sk, pf = s.cfg_gu
+        ext.prompt(s.xg, s.xu, ex.gate_ptr, ex.up_ptr, ex.gate_k2, ex.up_k2, ids, s.items, s.nitems, members,
+                   ex.svh_g, ex.svh_u, ex.suh_d, s.xd, s.y, 2, D, I, P, slots, E, D // (16 * w * sk), w, sk,
+                   float(limit), act_mode, ex.cb, PROMPT_PASS, prompt_kts(D, s.cfg_gu), ex.k2_gu[1])
+        nt, w, sk, pf = s.cfg_d
+        ext.prompt(s.xd, s.xd, ex.down_ptr, ex.down_ptr, ex.down_k2, ex.down_k2, ids, s.items, s.nitems, members,
+                   ex.svh_d, ex.svh_d, ex.svh_d, s.xd, s.y, 1, I, D, P, slots, E, I // (16 * w * sk), w, sk,
+                   float(limit), act_mode, ex.cb, PROMPT_PASS, prompt_kts(I, s.cfg_d), ex.k2_d[1])
+        if wts is None:
+            return s.y[:P]
+        if out is None:
+            out = torch.empty((R, D), dtype=torch.float32, device=x.device)
+        ext.combine(s.y, wts, out, R, D, slots)
+        return out
+    ld = LOADS if ex.aligned16 else 0
     nt, w, sk, pf = s.cfg_gu
     ext.grouped(s.xg, s.xu, ex.gate_ptr, ex.up_ptr, ex.gate_k2, ex.up_k2, ids, s.count, members, s.z, 2, D, I,
-                P, sk, slots, ex.cb, nt, w, pf, ex.k2_gu[0], ex.k2_gu[1])
+                P, sk, slots, ex.cb, nt, w, pf, ex.k2_gu[0], ex.k2_gu[1], ex.svh_d, s.y, False, ld)
     ext.gateup_epilogue(s.z, pick, ex.svh_g, ex.svh_u, ex.suh_d, s.xd, R, P, I, sk, slots, E, float(limit), act_mode)
     nt, w, sk, pf = s.cfg_d
+    # wts None, one split of 128-column blocks: the down epilogue fused into the grouped kernel (the same arithmetic)
+    fuse = wts is None and sk == 1 and nt == 8 and FUSE_DOWN
     ext.grouped(s.xd, s.xd, ex.down_ptr, ex.down_ptr, ex.down_k2, ex.down_k2, ids, s.count, members, s.z, 1, I,
-                D, P, sk, slots, ex.cb, nt, w, pf, ex.k2_d[0], ex.k2_d[1])
+                D, P, sk, slots, ex.cb, nt, w, pf, ex.k2_d[0], ex.k2_d[1], ex.svh_d, s.y, fuse, ld)
     if wts is None:
-        ext.down_epilogue(s.z, pick, ex.svh_d, s.y, R, P, D, sk, slots, E)
+        if not fuse:
+            ext.down_epilogue(s.z, pick, ex.svh_d, s.y, R, P, D, sk, slots, E)
         return s.y[:P]
     if out is None:
         out = torch.empty((R, D), dtype=torch.float32, device=x.device)
     # the down epilogue and the combine in one launch (the same arithmetic in the same order as the two)
     ext.down_combine(s.z, pick, ex.svh_d, s.y, wts, out, R, P, D, sk, slots, E)
     return out
+
+
+def prompt_kts(K: int, cfg) -> int:
+    """K tiles a prompt-kernel stage for a K-deep projection: the most (up to PROMPT_KTS) that divides its chains, or 0."""
+
+    nt, w, sk, pf = cfg
+    if K % (16 * w * sk):
+        return 0
+    chain = K // (16 * w * sk)
+    return next((k for k in (8, 4, 2) if k <= PROMPT_KTS and chain % k == 0), 0)
+
+
+def prompt_fits(s: Scratch, D: int, I: int) -> bool:
+    """Whether both tile settings suit the prompt kernel (chains of whole stages, 128 / 256 columns a block)."""
+
+    return (PROMPT_PASS in (16, 32) and prompt_kts(D, s.cfg_gu) > 0 and prompt_kts(I, s.cfg_d) > 0
+            and I % 128 == 0 and D % 256 == 0)
 
 
 def dequant(trellis: torch.Tensor, codebook: int | str) -> torch.Tensor:

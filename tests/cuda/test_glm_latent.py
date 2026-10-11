@@ -171,15 +171,15 @@ def test_select_tokens_vectorized_equals_loop(pos, R):
     tokens, counts = sparse.select_tokens(qi, wts, pk, pos, R, npool_max - 2, pos_dev)
     # the same pool choice the function made, fed to the reference loop
     scores = torch.empty((R, npool_max - 2), dtype=torch.float32, device="cuda")
-    sparse._scores[(R, -(-(npool_max - 2) // 64))](qi, wts, wts.stride(0), pk, scores, pos_dev, R, npool_max - 2,
-                                                    128 ** -0.5, 1.0 / 5.656854249492381, H=32, HP=32, D=128, BP=64,
-                                                    RB=1, num_warps=4)
+    # bf16 pooled keys: the scale argument unused (pk again), rows D apart (kv8.parts)
+    nb = -(-(npool_max - 2) // 64)
+    sparse._scores[(R, nb)](qi, wts, wts.stride(0), pk, pk, scores, pos_dev, R, npool_max - 2, 128 ** -0.5,
+                            1.0 / 5.656854249492381, H=32, HP=32, D=128, BP=64, L=1, RS=128, FP8=False, num_warps=4)
     blocked = torch.empty_like(scores)
-    sparse._scores[(-(-R // 16), -(-(npool_max - 2) // 64))](qi, wts, wts.stride(0), pk, blocked, pos_dev, R,
-                                                              npool_max - 2, 128 ** -0.5, 1.0 / 5.656854249492381, H=32,
-                                                              HP=32, D=128, BP=64, RB=16,
-                                                              num_warps=4)
-    assert torch.equal(scores, blocked), "row-blocked scores differ from one row a program"
+    sparse._scores[(R, -(-nb // 32))](qi, wts, wts.stride(0), pk, pk, blocked, pos_dev, R, npool_max - 2, 128 ** -0.5,
+                                      1.0 / 5.656854249492381, H=32, HP=32, D=128, BP=64, L=32, RS=128, FP8=False,
+                                      num_warps=4)
+    assert torch.equal(scores, blocked), "32 pool blocks a program differ from one"
     order = torch.sort(scores, dim=1, descending=True, stable=True).indices[:, :512]
     pools = torch.sort(order, dim=1).values.cpu()
     want_t, want_c = _select_tokens_loop(pools, pos, R)
@@ -328,9 +328,39 @@ def test_a_deep_prompt_chunk_stays_within_the_estimates_chunk_scratch():
 
 
 @cuda
+def test_a_deep_onepass_prompt_chunk_stays_within_the_lean_chunk_scratch():
+    """The same deepest chunk with TF_GLM_SPARSE_ONEPASS's kernel: token selection's transients alone, which
+    mla_chunk_scratch(onepass=True) budgets (Mia's 0028: no sparse partials)."""
+    from tensorfold.cuda.geometry import mla_chunk_scratch
+    from tensorfold.families.glm5_next.cuda import latent, sparse
+
+    text = {"num_attention_heads": 64, "kv_lora_rank": 512, "index_topk": 2048, "qk_nope_head_dim": 256}
+    cap, R, H, IH, ID = 262152, 2048, 32, 32, 128
+    pos = cap - 8 - R
+    gen = torch.Generator(device="cuda").manual_seed(4)
+
+    def rand(*shape):
+        return torch.empty(shape, dtype=torch.bfloat16, device="cuda").normal_(generator=gen)
+    cache, pk, qi, wts, qa = rand(cap, L), rand(cap // 4 + 2, ID), rand(R, IH * ID), rand(R, IH), rand(R, H, L)
+    ol = torch.zeros((R, H, L), dtype=torch.bfloat16, device="cuda")
+    pos_dev = torch.tensor([pos], dtype=torch.int32, device="cuda")
+    torch.cuda.synchronize()
+    torch.cuda.reset_peak_memory_stats()
+    base = torch.cuda.memory_allocated()
+    tokens, counts = sparse.select_tokens(qi, wts, pk, pos, R, cap // 4, pos_dev)
+    latent.sparse_onepass(qa, cache, tokens, counts, ol, 0.0625)
+    torch.cuda.synchronize()
+    used = torch.cuda.max_memory_allocated() - base
+    lean = mla_chunk_scratch(text, 2, cap, latent=True, onepass=True)
+    assert used <= lean, used
+    assert lean < mla_chunk_scratch(text, 2, cap, latent=True)
+
+
+@cuda
 @pytest.mark.parametrize("P, R", [(0, 2048), (0, 1100), (1900, 2048), (1024, 1500), (300, 530), (0, 600), (40, 300)])
 def test_dense_pass_in_row_blocks_keeps_the_bits(P, R):
-    """A prompt chunk's dense pass in PROMPT_ATT_ROWS-row blocks equals one latent.attention call, bitwise."""
+    """A prompt chunk's dense pass in PROMPT_ATT_ROWS-row blocks, each at pos + att_starts[i] (Mia's 0028), equals one
+    latent.attention call over the whole chunk (its full-chunk partials), bitwise; without the starts it refuses."""
     from tensorfold.families.glm5_next.cuda import forward, latent
 
     gen = torch.Generator(device="cuda").manual_seed(P + R)
@@ -344,13 +374,16 @@ def test_dense_pass_in_row_blocks_keeps_the_bits(P, R):
     del whole
     s = latent.LatentScratch(R, heads, nch, "cuda", part_rows=forward.PROMPT_ATT_ROWS)
     assert s.po.numel() == nch * min(R, forward.PROMPT_ATT_ROWS) * heads * L
+    starts = torch.arange(0, 2048, s.part_rows, dtype=torch.int32, device="cuda")   # Buffers.att_starts of a chunk
     got = torch.full((R, heads, L), float("nan"), dtype=torch.bfloat16, device="cuda")
-    forward.dense_attention(qa, cache, pos, s, scale=0.07, nch=nch, out=got)
+    forward.dense_attention(qa, cache, pos, s, scale=0.07, nch=nch, out=got, hb=latent.head_block(R), starts=starts)
     torch.cuda.synchronize()
     assert torch.equal(got.view(torch.int16), want.view(torch.int16))
     if R > s.part_rows:                                             # one call past the partials' rows refuses
         with pytest.raises(ValueError, match="past the scratch"):
             latent.attention(qa, cache, pos, s, scale=0.07, nch=nch, out=got)
+        with pytest.raises(ValueError, match="start offsets"):
+            forward.dense_attention(qa, cache, pos, s, scale=0.07, nch=nch, out=got)
 
 
 @cuda

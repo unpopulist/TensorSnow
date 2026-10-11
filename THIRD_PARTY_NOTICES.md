@@ -117,3 +117,66 @@ The multimodal rotary and image-feature integration is adapted from MiaAI-Lab's
 [Flash Next vision patch 0008](https://github.com/MiaAI-Lab/Qwen3.8-Flash-Next-Single-DGX-Spark-TensorFold/blob/a3aa89835022c55ca8e55008c37785954834e04f/patches/0008-flash-next-vision.patch),
 MIT License, Copyright (c) 2026 MiaAI-Lab. The license is included in `LICENSES/MiaAI-Lab-MIT.txt`.
 The port preserves the v0.5 CUDA execution APIs and adds an offline EXL3 vision adapter.
+
+## RoCE all-gather (`TF_COMM_BACKEND=roce`)
+
+`src/tensorfold/cuda/roce_proxy.c` is b12x's RoCE proxy ("RoCEnante",
+[b12x](https://github.com/local-inference-lab/b12x) `b12x/comm/roce/_roce_proxy.c` at commit
+8a99d639410e39d5f39cb4037675331beceea1d4), Copyright the b12x contributors, Apache License 2.0, unchanged except its
+header; `roce.cu` reimplements b12x's CuTe all-gather kernel in CUDA C++. `roce.cpp`, `roce.cu`, `roce.py` and the
+proxy come from MiaAI-Lab's
+[GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold)
+patches 0006, 0052 and 0040 (Apache License 2.0), adapted to `tensorfold.cuda.comm`'s transport interface.
+See [the license text](LICENSES/Apache-2.0.txt).
+
+## RED-SNOW port (GLM-5.3-Flash EXL3 on two DGX Sparks)
+
+The two-rank GLM-5.3-Flash EXL3 work in this tree (native EXL3 dense matrices, the FP8 latent cache, multi-stream
+decoding, copy drafts, the DFlash2 policy, prefill and decode kernels, the spill tier, the server additions and
+`deploy/redsnow`) ports much of
+[MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold),
+a patch series against TensorFold v0.6.0, Copyright 2026 MiaAI-Lab, Apache License 2.0. Code comments name the
+patch a change comes from ("Mia's 0038" is that series' patch 0038). The ported patches include parts contributed to
+that project by others, credited there and here:
+
+- 0054 (image prompts resume from kept prompt states): [abhicnv007](https://github.com/abhicnv007).
+- 0063 (kept-prompt cap drops superseded states first): [Alexbob0](https://github.com/Alexbob0), pull request #32.
+- 0071 (shared-prefix copy), 0072 (display reservation in the pool; the technique proposed by
+  [gabewillen](https://github.com/gabewillen)) and 0074 (compact before evict): [ezoushen](https://github.com/ezoushen).
+- 0073 (queued requests dropped when their client leaves): [desy0305](https://github.com/desy0305), with
+  delivery-failure handling from [johnwhited](https://github.com/johnwhited).
+- 0077 (shared prefixes evicted by recency): diagnosis by [meleesciony](https://github.com/meleesciony).
+- 0078 (take-over decides, then copies): [m-naoki-m](https://github.com/m-naoki-m).
+- 0079 (picture cache), 0080 (quoted vision markers) and 0089 (kept-state budgets):
+  [ThomasWadeZ](https://github.com/ThomasWadeZ).
+- 0082 / 0083 (admission cap, delivery abort): [johnwhited](https://github.com/johnwhited), following vLLM's
+  (Apache-2.0) admission and abort behaviour as a reference.
+- 0085 / 0086 (split selection and prompt scoring loops) and 0087 (display reservation through an external lender;
+  nothing of that lender ships here): [BadAd84](https://github.com/BadAd84).
+- 0088 (spill tier, `src/tensorfold/cuda/spill.py`): Robert Wojciechowski ([wojo](https://github.com/wojo)); its
+  multi-rank design follows patch 0250 of jayleaton/glm53-tensorfold-spark, and its conventions credit TensorFold's
+  MLX spill ([gilby](https://github.com/gilby), PR #68), [raymondkpwong](https://github.com/raymondkpwong) (issue
+  #155), [gabewillen](https://github.com/gabewillen) (the idea) and [jakejharris](https://github.com/jakejharris)'s
+  JSpark3 session tier.
+- 0097 (kept entries as a share of the pool): diagnosis by [jdecker76](https://github.com/jdecker76).
+- 0012 / 0014 / 0039 (chunked KDA prompt kernel): the chunked WY form follows the published chunkwise algorithm as
+  implemented in [flash-linear-attention](https://github.com/fla-org/flash-linear-attention) (MIT); the kernels are
+  written anew.
+
+Everything else in those patches is by MiaAI-Lab. The port to RED-SNOW's mixed-width EXL3 pack, the two-rank split
+rules for it, and the launcher in `deploy/redsnow` are this tree's own work under the Apache License 2.0.
+
+### jayleaton/glm53-tensorfold-spark
+
+[jayleaton/glm53-tensorfold-spark](https://github.com/jayleaton/glm53-tensorfold-spark), Copyright 2026 Jay Leaton,
+Apache License 2.0:
+
+- `src/tensorfold/families/glm5_next/cuda/l2pf.cu`, `l2pf.cpp`, `l2pf.py` (`TF_GLM_L2PF`): the L2 prefetch kernel,
+  adapted from that project's patch 0460 by way of MiaAI-Lab's patch 0046 (changes listed in `l2pf.cu`).
+- `src/tensorfold/cuda/exl3/experts_grouped.cuh` (`TF_EXL3_LOADS=nc`): 16-byte trellis loads in the routed-expert
+  decode kernel, after MiaAI-Lab's patch 0047, the idea adapted from that project's patch 0580.
+- `src/tensorfold/tool_parameters.py` and `src/tensorfold/families/glm5_next/cuda/kept_reasoning.py`: parts adapted
+  from that project's patch 0620 (listed in each file's docstring).
+
+The b12x RoCE transport used by `TF_COMM_BACKEND=roce` is credited in the section above.
+See [the license text](LICENSES/Apache-2.0.txt).

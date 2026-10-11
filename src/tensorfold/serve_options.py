@@ -57,8 +57,9 @@ def check(args: argparse.Namespace, family: Any, backend: str, config_dir: Any =
         if backend != "cuda":
             raise ValueError("--vision-offload is for the CUDA backend; the Mac's image tower already shares host memory")
     if getattr(args, "vision", False):             # only --vision reads the config here
-        if family.model_type == "glm5_next" and backend != "mlx":
-            raise ValueError("GLM-5.3-Flash image input is currently MLX-only")
+        if family.model_type == "glm5_next" and backend == "cuda" and (images is not None or tokens is not None):
+            raise ValueError("--vision-max-images / --vision-image-tokens size CUDA Qwen's images; GLM-5.3 on CUDA "
+                             "reads TENSORFOLD_GLM_MAX_IMAGES and TENSORFOLD_GLM_IMAGE_TOKENS instead")
         from tensorfold.families import read_config
         from tensorfold.vision.config import validate_vision_config
 

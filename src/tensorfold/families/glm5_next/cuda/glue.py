@@ -159,15 +159,115 @@ def _hc_finish(X, PART, BASE, SCALE, NW, OUT, XS, POST, COMB, eps_norm, hc_eps,
     tl.store(XS + r * (D // 64) + tl.arange(0, BLOCK // 64), g)
 
 
+@triton.jit
+def _hc_partial_mma(X, FN, PART, R, WIDE: tl.constexpr, NB: tl.constexpr, BM: tl.constexpr, BK: tl.constexpr,
+                    SPLIT: tl.constexpr = False):
+    """Prompt rows, program (row block, K block): _hc_partial's 24 dots on the tensor cores (one fp32 chain over
+    ascending k tiles, a row's bits independent of the other rows) and its sum of squares, in PART's layout.
+    ``SPLIT``: fp32 mixing weights (RED-SNOW) as three bf16 terms hi + mid + lo, which add up to every one of
+    RED-SNOW's weights exactly (3 x 8 significand bits), so each product is exact and only the order of the fp32
+    sums differs from _hc_partial (lo, mid, hi into the one chain each k tile; the same time as one bf16 dot: the
+    kernel reads x at the memory's pace)."""
+
+    rm = tl.program_id(0) * BM + tl.arange(0, BM)
+    b = tl.program_id(1)
+    KB: tl.constexpr = WIDE // NB
+    m = tl.arange(0, 32)
+    k = tl.arange(0, BK)
+    ok = rm < R
+    acc = tl.zeros((BM, 32), dtype=tl.float32)
+    ss = tl.zeros((BM,), dtype=tl.float32)
+    for t in range(KB // BK):
+        base = b * KB + t * BK
+        x = tl.load(X + rm[:, None] * WIDE + base + k[None, :], mask=ok[:, None], other=0.0)
+        w = tl.load(FN + m[None, :] * WIDE + base + k[:, None], mask=m[None, :] < 24, other=0.0)
+        if SPLIT:
+            hi = w.to(tl.bfloat16)
+            r = w - hi.to(tl.float32)
+            mid = r.to(tl.bfloat16)
+            acc = tl.dot(x, (r - mid.to(tl.float32)).to(tl.bfloat16), acc)
+            acc = tl.dot(x, mid, acc)
+            acc = tl.dot(x, hi, acc)
+        else:
+            acc = tl.dot(x, w, acc)
+        xf = x.to(tl.float32)
+        ss += tl.sum(xf * xf, axis=1)
+    tl.store(PART + (rm[:, None] * NB + b) * 32 + m[None, :], acc, mask=ok[:, None] & (m[None, :] < 24))
+    tl.store(PART + (rm * NB + b) * 32 + 24, ss, mask=ok)
+
+
+HC_MMA = __import__("os").environ.get("TF_GLM_HC_MMA", "1") != "0"    # prompt rows' mixing dots on the tensor cores
+# TF_GLM_HC_PRE_ROWS (default 256, a multiple of 64; 0: off): a prompt chunk's hc_pre in row pieces of this many,
+# each piece's mixing dots then its _hc_finish, so the finish re-reads the piece's x (32 KiB a row, 8 MiB) from the
+# 24 MiB L2 rather than DRAM (RED-SNOW, GB10: 2,048 rows 740 -> 551 us, 1,024 348 -> 280; chunks past twice this).
+# The same bits: both kernels are per row
+HC_PRE_ROWS = int(__import__("os").environ.get("TF_GLM_HC_PRE_ROWS", "256"))
+if HC_PRE_ROWS < 0 or HC_PRE_ROWS % 64:
+    raise ValueError(f"TF_GLM_HC_PRE_ROWS: 0 or a multiple of 64, not {HC_PRE_ROWS}")
+# TF_GLM_HC_CHAIN (default on; 0: off): a prompt chunk's hc_post and the glue after it (taps, the next hc_pre or the
+# final mean) run together on each HC_PRE_ROWS-row piece (``hc_chain``), so the next hc_pre reads the streams hc_post
+# just wrote from L2, not DRAM (x is 32 KiB a row: 64 MiB at 2,048 rows; GB10's L2 is 24 MiB). Pieced past two pieces,
+# as hc_pre: RED-SNOW's 90 hc tensors, a hand-off (graphs) 2,048 rows 1,465 -> 1,314 us, 1,024 687 -> 640, but 512
+# rows in two pieces 307 -> 330 (whole is faster there). The same bits: every kernel is per row
+HC_CHAIN = __import__("os").environ.get("TF_GLM_HC_CHAIN", "1") != "0"
+
+
+def hc_chain(lo: int, hi: int, post, then, *, prompt: bool) -> None:
+    """``post(a, z)`` (an hc_post of rows a .. z) then ``then(a, z)`` (row-independent glue reading those rows' streams)
+    over rows lo .. hi: a prompt chunk's past 2 HC_PRE_ROWS rows in HC_PRE_ROWS-row pieces (TF_GLM_HC_CHAIN), each
+    piece's ``then`` right
+    after its ``post``; otherwise once over every row. Row-independent kernels: the same bits either way."""
+
+    step = HC_PRE_ROWS if prompt and HC_CHAIN and HC_PRE_ROWS and hi - lo > 2 * HC_PRE_ROWS else max(1, hi - lo)
+    for a in range(lo, hi, step):
+        z = min(hi, a + step)
+        post(a, z)
+        then(a, z)
+
+
+def hc_dec() -> bool:
+    """TF_GLM_HC_DEC (default on): decode rows' mixing dots in hc.cu, 48 blocks a row instead of 16, _hc_partial's
+    bits (bf16 mixing weights as in Mia's checkpoint, or RED-SNOW's fp32 ones); 0: _hc_partial."""
+    return __import__("os").environ.get("TF_GLM_HC_DEC", "1") != "0"
+
+
+@__import__("functools").lru_cache(maxsize=1)
+def _hc_ext():
+    from pathlib import Path
+
+    from tensorfold.cuda.build import load
+
+    here = Path(__file__).parent
+    return load(name="tensorfold_glm_hc_v3", sources=[str(here / "hc.cpp"), str(here / "hc.cu")],
+                extra_cuda_cflags=["-O3"], verbose=False)
+
+
 def hc_pre(x: torch.Tensor, fn: torch.Tensor, base: torch.Tensor, scale: torch.Tensor, norm_w: torch.Tensor,
            out: torch.Tensor, xs: torch.Tensor, post: torch.Tensor, comb: torch.Tensor, part: torch.Tensor,
-           eps: float, hc_eps: float, iters: int) -> None:
-    """x [R, S*D] bf16 streams -> out [R, D] (normed collapsed row) + xs, and post [R, S], comb [R, S, S]."""
+           eps: float, hc_eps: float, iters: int, *, prompt: bool = False) -> None:
+    """x [R, S*D] bf16 streams -> out [R, D] (normed collapsed row) + xs, and post [R, S], comb [R, S, S];
+    ``prompt``: a prompt chunk's rows, their mixing dots on the tensor cores (other bits than decode rows')."""
 
     rows, wide = x.shape
     d = norm_w.shape[0]
     s = wide // d
-    _hc_partial[(rows, HC_BLOCKS)](x, fn, part, WIDE=wide, NB=HC_BLOCKS, SUB=128, num_warps=4)
+    # the tensor-core dots take bf16 mixing weights (Mia's checkpoint) or RED-SNOW's fp32 ones split in three exact
+    # bf16 terms (no bf16 copy: that would change every prompt row's mixing)
+    if prompt and HC_MMA and x.is_contiguous() and fn.dtype in (torch.bfloat16, torch.float32):
+        if HC_PRE_ROWS and rows > 2 * HC_PRE_ROWS:          # 512 rows (16 MiB) still sit in L2 whole
+            for lo in range(0, rows, HC_PRE_ROWS):
+                hi = min(rows, lo + HC_PRE_ROWS)
+                hc_pre(x[lo:hi], fn, base, scale, norm_w, out[lo:hi], xs[lo:hi], post[lo:hi], comb[lo:hi],
+                       part[lo:hi], eps, hc_eps, iters, prompt=True)
+            return
+        _hc_partial_mma[(triton.cdiv(rows, 64), HC_BLOCKS)](x, fn, part, rows, WIDE=wide, NB=HC_BLOCKS, BM=64, BK=64,
+                                                            SPLIT=fn.dtype == torch.float32, num_warps=4, num_stages=3)
+    elif (hc_dec() and wide == 16384 and fn.shape[0] == 24 and HC_BLOCKS == 16
+          and fn.dtype in (torch.bfloat16, torch.float32) and x.is_contiguous() and fn.is_contiguous()
+          and part.is_contiguous()):
+        _hc_ext().hc_partial(x, fn, part, rows)                  # _hc_partial's bits on 48 blocks a row (Mia's 0019)
+    else:
+        _hc_partial[(rows, HC_BLOCKS)](x, fn, part, WIDE=wide, NB=HC_BLOCKS, SUB=128, num_warps=4)
     _hc_finish[(rows,)](x, part, base, scale, norm_w, out, xs, post, comb, eps, hc_eps, D=d, S=s, NB=HC_BLOCKS,
                         ITERS=iters, BLOCK=d, num_warps=8)
 
@@ -208,6 +308,41 @@ def hc_post(x: torch.Tensor, xout: torch.Tensor, gathered: torch.Tensor, post: t
     block = min(1024, d)
     _hc_post[(rows, d // block)](x, xout, gathered, post, comb, rows * d, D=d, S=s, WORLD=world, BLOCK=block,
                                  num_warps=4)
+
+
+def hc_post_rows(x: torch.Tensor, gathered: torch.Tensor, post: torch.Tensor, comb: torch.Tensor, lo: int,
+                 hi: int) -> None:
+    """``hc_post(x, x, gathered, post, comb)`` of rows lo .. hi only (x, post, comb indexed as gathered's rows,
+    gathered [world, R, D] contiguous): the same kernel, the ranks' partials still ``gathered.stride(0)`` apart."""
+
+    world, rows, d = gathered.shape
+    if not gathered.is_contiguous() or not 0 <= lo <= hi <= rows:
+        raise ValueError("hc_post_rows: rows of contiguous [world, R, D] partials")
+    if hi == lo:
+        return
+    s = x.shape[1] // d
+    block = min(1024, d)
+    xr = x[lo:hi]
+    _hc_post[(hi - lo, d // block)](xr, xr, gathered[0, lo:hi], post[lo:hi], comb[lo:hi], gathered.stride(0), D=d,
+                                    S=s, WORLD=world, BLOCK=block, num_warps=4)
+
+
+def hc_post_pair(x: torch.Tensor, xout: torch.Tensor, g0: torch.Tensor, g1: torch.Tensor, post: torch.Tensor,
+                 comb: torch.Tensor) -> None:
+    """``hc_post`` of two ranks' fp32 partials [R, D] held apart (rank 0's ``g0``, rank 1's ``g1``): the same kernel
+    with rank 1's rows read at their distance from rank 0's (element offset, may be negative), so the sum (rank 0
+    first) and every bit are hc_post's (TF_GLM_HC_SPLIT)."""
+
+    rows, d = g0.shape
+    if (g1.shape != g0.shape or g0.dtype != torch.float32 or g1.dtype != torch.float32
+            or not (g0.is_contiguous() and g1.is_contiguous())):
+        raise ValueError("hc_post_pair: two contiguous fp32 partials of one shape")
+    if not rows:
+        return
+    s = x.shape[1] // d
+    block = min(1024, d)
+    rs = (g1.data_ptr() - g0.data_ptr()) // g0.element_size()
+    _hc_post[(rows, d // block)](x, xout, g0, post, comb, rs, D=d, S=s, WORLD=2, BLOCK=block, num_warps=4)
 
 
 @triton.jit
@@ -407,3 +542,28 @@ def combine(y: torch.Tensor, wts: torch.Tensor, out: torch.Tensor) -> None:
     rows, d = out.shape
     block = min(1024, d)
     _combine[(rows, d // block)](y, wts, out, D=d, SLOTS=wts.shape[1], BLOCK=block, num_warps=4)
+
+
+@triton.jit
+def _combine_sy(Y, SY, WTS, OUT, D: tl.constexpr, SLOTS: tl.constexpr, BLOCK: tl.constexpr):
+    """``_combine`` with the shared expert's row read from SY [R, D] fp32 instead of Y's last slot: the same terms
+    (w_k y_k, the shared one times its weight 1) added in the same slot order, so the same bits."""
+
+    r = tl.program_id(0)
+    c = tl.program_id(1)
+    d = c * BLOCK + tl.arange(0, BLOCK)
+    acc = tl.zeros((BLOCK,), dtype=tl.float32)
+    for k in tl.static_range(SLOTS - 1):
+        acc = acc + tl.load(Y + (r * SLOTS + k) * D + d).to(tl.float32) * tl.load(WTS + r * SLOTS + k)
+    acc = acc + tl.load(SY + r * D + d).to(tl.float32) * tl.load(WTS + r * SLOTS + SLOTS - 1)
+    tl.store(OUT + r * D + d, acc)
+
+
+def combine_shared(y: torch.Tensor, sy: torch.Tensor, wts: torch.Tensor, out: torch.Tensor) -> None:
+    """combine(y with its last slot replaced by sy): y [R, slots, D] (the last slot not read), sy [R, D] fp32."""
+
+    rows, d = out.shape
+    if y.dtype != torch.float32 or sy.dtype != torch.float32 or not (y.is_contiguous() and sy.is_contiguous()):
+        raise ValueError("combine_shared: contiguous fp32 expert rows")
+    block = min(1024, d)
+    _combine_sy[(rows, d // block)](y, sy, wts, out, D=d, SLOTS=wts.shape[1], BLOCK=block, num_warps=4)

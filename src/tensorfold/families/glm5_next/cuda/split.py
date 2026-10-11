@@ -45,23 +45,72 @@ SMALL = ("config.json", "generation_config.json", "tokenizer.json", "tokenizer_c
          "processor_config.json", "model.safetensors.index.json")
 
 
-# EXL3 gate/up split tile columns and svh; down splits tile rows and suh; each replicates the remaining tensors.
-EXL3_EXPERT = re.compile(r"\.mlp\.experts\.\d+\.(gate|up|down)_proj\.(trellis|suh|svh|mcg)$")
-EXL3_RULES = {("gate", "trellis"): "dim1", ("gate", "suh"): "rep", ("gate", "svh"): "row",
-              ("down", "trellis"): "row", ("down", "suh"): "row", ("down", "svh"): "rep"}
+# EXL3 linears are stored as trellis I16 [K/16, N/16, 16*bits] (input K, output N), suh F16 [K], svh F16 [N] and a
+# codebook scalar (mul1 I32 [] or mcg); y = rot_N(rot_K(x * suh) @ W) * svh with the Hadamard rotations applied per
+# 128-wide block, so a split is exact iff every rank boundary is a multiple of 128 on the split axis (``check_exl3``).
+# Output split ("cols": gate/up, q_b, lm_head vocab): trellis tile columns (dim1) and svh; suh copied.
+# Input split ("rows", all-reduced: down, o_proj): trellis tile rows (row) and suh; svh copied.
+# The codebook scalar (mul1 / mcg) is the same on every rank and copied; so are the low-rank q_a / kv_a and MTP eh_proj.
+EXL3_EXPERT = re.compile(r"\.mlp\.experts\.\d+\.(gate|up|down)_proj\.(trellis|suh|svh|mcg|mul1)$")
+EXL3_PART = re.compile(r"\.(trellis|suh|svh|mcg|mul1)$")
+EXL3_OUT = (r"\.mlp\.experts\.\d+\.(gate|up)_proj\.", r"\.mlp\.shared_experts\.(gate|up)_proj\.",
+            r"\.mlp\.(gate|up)_proj\.", r"\.self_attn\.q_b_proj\.", r"^lm_head\.")
+EXL3_IN = (r"\.mlp\.experts\.\d+\.down_proj\.", r"\.mlp\.shared_experts\.down_proj\.", r"\.mlp\.down_proj\.",
+           r"\.self_attn\.o_proj\.")
+EXL3_REP = (r"\.self_attn\.(q_a_proj|kv_a_proj_with_mqa)\.", r"\.eh_proj\.")
+# KDA's q/k/v are fused along the output: qkv_proj's N (and conv1d's rows) is [q | k | v], each heads x 128, and rank
+# r takes heads [r*H/ranks, (r+1)*H/ranks) of each of the three. The rank keeps the name qkv_proj (conv1d) for its
+# concatenated [q_r | k_r | v_r]: one valid EXL3 linear (K 4096, N 3*H/ranks*128) per rank, in the order KDAW.conv
+# already uses, so a rank folder holds the same names as the checkpoint.
+EXL3_FUSED3 = r"\.self_attn\.qkv_proj\."
+FUSED3_PLAIN = r"\.self_attn\.conv1d\.weight$"
+EXL3_KINDS = {"out": {"trellis": "dim1", "suh": "rep", "svh": "row"},
+              "in": {"trellis": "row", "suh": "row", "svh": "rep"},
+              "fused3": {"trellis": "fused3_dim1", "suh": "rep", "svh": "fused3_row"},
+              "rep": {"trellis": "rep", "suh": "rep", "svh": "rep"}}
+# what each split kind does to the shape (for size estimates such as ``tensorfold.cuda.geometry.split_weights``)
+GEOMETRY_KIND = {"fused3_dim1": "dim1", "fused3_row": "row"}
 
 
 def rule(name: str) -> str:
     if name.startswith("model.visual."):
         return "drop"
-    m = EXL3_EXPERT.search(name)
+    m = EXL3_PART.search(name)
     if m:
-        proj, part = m.groups()
-        return "rep" if part == "mcg" else EXL3_RULES[("gate" if proj == "up" else proj, part)]
+        part = m.group(1)
+        groups = [g for g, pats in (("out", EXL3_OUT), ("in", EXL3_IN), ("fused3", (EXL3_FUSED3,)), ("rep", EXL3_REP))
+                  if any(re.search(p, name) for p in pats)]
+        if len(groups) != 1:
+            raise ValueError(f"{name}: EXL3 split rule is ambiguous or missing ({groups})")
+        return "rep" if part in ("mul1", "mcg") else EXL3_KINDS[groups[0]][part]
+    if re.search(FUSED3_PLAIN, name):
+        return "fused3_row"
     hits = [kind for kind, pats in (("row", ROW), ("col", COL), ("rep", REP)) if any(re.search(p, name) for p in pats)]
     if len(hits) != 1:
         raise ValueError(f"{name}: split rule is ambiguous or missing ({hits})")
     return hits[0]
+
+
+def geometry_rule(name: str) -> str:
+    """``rule`` with the fused kinds named by the axis they halve (row / dim1), for shape-only callers."""
+
+    kind = rule(name)
+    return GEOMETRY_KIND.get(kind, kind)
+
+
+def check_exl3(name: str, shape: list[int], kind: str, ranks: int) -> None:
+    """Raise unless every rank boundary of an EXL3 tensor (or the fused conv1d) is a multiple of 128 elements, the
+    Hadamard block: then each rank's piece is bit-exact with its slice of the full linear."""
+
+    m = EXL3_PART.search(name)
+    if kind in ("rep", "drop") or not (m or re.search(FUSED3_PLAIN, name)):
+        return
+    axis = 1 if kind in ("dim1", "fused3_dim1") else 0
+    parts = ranks * (3 if kind.startswith("fused3") else 1)
+    tile = 16 if m and m.group(1) == "trellis" else 1        # trellis axes count 16-element tiles
+    if len(shape) <= axis or shape[axis] % parts or (shape[axis] // parts * tile) % 128:
+        raise ValueError(f"{name}: {kind} split of {shape} over {ranks} ranks leaves a boundary that is not a multiple "
+                         "of the 128-wide Hadamard block")
 
 
 def read_header(path: str | Path) -> tuple[dict, int]:
@@ -98,7 +147,27 @@ def split_bytes(raw: np.ndarray, shape: list[int], itemsize: int, kind: str, ran
         chunk = shape[1] // ranks
         part = np.ascontiguousarray(view[:, rank * chunk * inner:(rank + 1) * chunk * inner])
         return part.reshape(-1), [shape[0], chunk] + list(shape[2:])
+    if kind in FUSED3_AXIS:
+        outer, inner, chunk, out = _fused3(shape, itemsize, kind, ranks)
+        part = np.ascontiguousarray(raw.reshape(outer, 3, ranks, chunk * inner)[:, :, rank])
+        return part.reshape(-1), out
     raise ValueError(kind)
+
+
+FUSED3_AXIS = {"fused3_row": 0, "fused3_dim1": 1}
+
+
+def _fused3(shape: list[int], itemsize: int, kind: str, ranks: int) -> tuple[int, int, int, list[int]]:
+    """A [.. | 3*n | ..] axis holding [a | b | c] -> rank r's [a_r | b_r | c_r]: (outer count, inner bytes, rows per
+    rank and third, the rank's shape)."""
+
+    axis = FUSED3_AXIS[kind]
+    if len(shape) <= axis or shape[axis] % (3 * ranks):
+        raise ValueError(f"{kind} split needs axis {axis} divisible by 3*{ranks}, got {shape}")
+    outer = int(np.prod(shape[:axis]))
+    inner = int(np.prod(shape[axis + 1:])) * itemsize
+    chunk = shape[axis] // (3 * ranks)
+    return outer, inner, chunk, list(shape[:axis]) + [3 * chunk] + list(shape[axis + 1:])
 
 
 def split_device(raw, shape: list[int], itemsize: int, kind: str, rank: int, ranks: int = 2):
@@ -118,6 +187,9 @@ def split_device(raw, shape: list[int], itemsize: int, kind: str, rank: int, ran
         chunk = shape[1] // ranks
         part = raw.view(shape[0], shape[1] * inner)[:, rank * chunk * inner:(rank + 1) * chunk * inner]
         return part.contiguous().reshape(-1), [shape[0], chunk] + list(shape[2:])
+    if kind in FUSED3_AXIS:
+        outer, inner, chunk, out = _fused3(shape, itemsize, kind, ranks)
+        return raw.view(outer, 3, ranks, chunk * inner)[:, :, rank].contiguous().reshape(-1), out
     raise ValueError(kind)
 
 
@@ -135,6 +207,8 @@ def rank_files(model_dir: str | Path, rank: int) -> list[Path]:
 
 class RankReader:
     """Read stored-dtype CPU tensors for one rank from the full checkpoint or its pre-split folder."""
+
+    rule = staticmethod(rule)                             # name -> split kind (another family can pass its own)
 
     def __init__(self, model_dir: str | Path, rank: int, ranks: int = 2) -> None:
         from tensorfold.cuda.direct_read import ReadAhead, Reader, SafeTensors
@@ -191,11 +265,12 @@ class RankReader:
             self.files[file] = read_header(file)
         header, base = self.files[file]
         info = header[name]
-        kind = rule(name)
+        kind = self.rule(name)
         if kind == "drop":
             raise KeyError(f"{name} is not used by the engine")
         a, b = info["data_offsets"]
         shape = list(info["shape"])
+        check_exl3(name, shape, kind, self.ranks)
         if kind == "row" and shape and shape[0] % self.ranks == 0:   # the rank's rows are one run: read only those
             chunk = shape[0] // self.ranks
             per = (b - a) // shape[0] * chunk
@@ -254,7 +329,7 @@ def split_file(src: str | Path, out: str | Path, rank: int, ranks: int = 2) -> d
     metadata = header.pop("__metadata__", None)
     mm = np.memmap(src, dtype=np.uint8, mode="r")
     stem = os.path.basename(str(src)).replace(".safetensors", "")
-    summary = {"rep": 0, "row": 0, "col": 0, "dim1": 0, "drop": 0}
+    summary = {"rep": 0, "row": 0, "col": 0, "dim1": 0, "fused3_row": 0, "fused3_dim1": 0, "drop": 0}
     part = []
     for name in sorted(header, key=lambda k: header[k]["data_offsets"][0]):
         info = header[name]
@@ -264,6 +339,7 @@ def split_file(src: str | Path, out: str | Path, rank: int, ranks: int = 2) -> d
             continue
         a, b = info["data_offsets"]
         itemsize = DTYPE_BYTES[info["dtype"]]
+        check_exl3(name, info["shape"], kind, ranks)
         data, shape = split_bytes(mm[base + a:base + b], info["shape"], itemsize, kind, rank, ranks)
         if int(np.prod(shape)) * itemsize != data.size:
             raise ValueError(f"{name}: {shape} does not match {data.size} bytes")

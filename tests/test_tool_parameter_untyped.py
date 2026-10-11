@@ -7,7 +7,7 @@ from tensorfold.tool_parameters import decode_parameter, typed_parameter
 
 @pytest.mark.parametrize("schema,value", [
     ({}, "None"),                          # no type at all
-    ({"type": ["integer", "null"]}, "5"),   # a list where a type name belongs
+    ({"type": ["string", "null"]}, "5"),    # a union with string keeps the text
     ({"type": "weird"}, "None"),            # a name the type dict does not name
     ({"type": "string"}, "7.5"),            # a scalar type that takes no decode path
 ])
@@ -15,6 +15,12 @@ def test_untyped_schemas_keep_the_text(schema, value):
     assert not typed_parameter(schema)
     for python in (True, False):
         assert decode_parameter(value, schema, python=python) == value
+
+
+def test_a_type_list_without_string_is_typed():
+    assert typed_parameter({"type": ["integer", "null"]})
+    assert decode_parameter("5", {"type": ["integer", "null"]}) == 5
+    assert decode_parameter("null", {"type": ["integer", "null"]}) is None
 
 
 def test_a_typed_schema_still_decodes():

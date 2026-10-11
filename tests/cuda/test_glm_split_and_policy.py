@@ -176,7 +176,7 @@ def test_policies_and_the_request_header():
     assert encode_policy("auto") == [4, 2, 8, 30000] and encode_policy("auto:1:2:0.05") == [5, 1, 2, 50000]
     assert decode_policy(encode_policy("auto")) == ("auto", 2, 8, 0.03, False)
     assert decode_policy(encode_policy("auto:1:2:0.05")) == ("auto", 1, 2, 0.05, True)
-    for bad in ("", "x", "c3", "c9:0.3", "9", "-1", "a:0.6", "ab", "auto:1", "auto:0:1:0.1", "auto:1:1:1.5"):
+    for bad in ("", "x", "c3", "c16:0.3", "16", "-1", "a:0.6", "ab", "auto:1", "auto:0:1:0.1", "auto:1:1:1.5"):
         with pytest.raises(ValueError):
             encode_policy(bad)
     assert decode_policy(encode_policy("0")) is None
@@ -269,7 +269,7 @@ def test_requests_past_the_context_get_a_400_before_streaming(tmp_path):
                     conn.close()
 
 
-def test_check_accepts_mlx_4bit_and_mias_exl3_only(tmp_path):
+def test_check_accepts_mlx_4bit_and_exl3_mcg_or_mul1(tmp_path):
     from tensorfold.families import glm5_next
 
     assert glm5_next.QUANT_METHODS == {"mlx": ("mlx",), "cuda": ("mlx", "exl3")}
@@ -279,9 +279,12 @@ def test_check_accepts_mlx_4bit_and_mias_exl3_only(tmp_path):
         "exl3": ({"quantization_config": {"quant_method": "exl3", "bits": 4, "codebook": "mcg",
                                           "scope": "glm53_routed_experts_only"}}, True),
         "exl3-3bit": ({"quantization_config": {"quant_method": "exl3", "bits": 3, "codebook": "mcg",
-                                               "scope": "glm53_routed_experts_only"}}, False),
+                                               "scope": "glm53_routed_experts_only"}}, True),
+        "red-snow": ({"quantization_config": {"quant_method": "exl3", "version": "1.4.9", "bits": 5, "head_bits": 8,
+                                              "out_scales": "always", "codebook": "mul1", "mtp_bits": 4}}, True),
         "exl3-all": ({"quantization_config": {"quant_method": "exl3", "bits": 4, "codebook": "3inst",
                                               "scope": "all"}}, False),
+        "exl3-9bit": ({"quantization_config": {"quant_method": "exl3", "bits": 9, "codebook": "mul1"}}, False),
     }
     for name, (quant, ok) in cases.items():
         d = tmp_path / name

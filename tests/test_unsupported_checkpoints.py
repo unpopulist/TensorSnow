@@ -71,17 +71,88 @@ def test_a_family_can_read_every_exl3_codebook_and_width():
         families.require_readable(family, EXL3, "mlx")
 
 
+RED_SNOW = {"model_type": "glm5_next", "quantization_config": {
+    "quant_method": "exl3", "version": "1.4.9", "bits": 5, "head_bits": 8, "out_scales": "always", "codebook": "mul1",
+    "mtp_bits": 4}}                                      # vcruz305/RED-SNOW-5.3-FLASH-EXL3-SAGE-4.91bpw's config.json
+
+
 def test_glm_reads_mias_exl3_checkpoint_as_an_experiment(tmp_path, capsys):
     from tensorfold.families import glm5_next
 
     (tmp_path / "config.json").write_text(json.dumps(EXL3))
     glm5_next.check(tmp_path)
     assert "experimental" in capsys.readouterr().out
-    for key, value in (("bits", 3), ("codebook", "3inst"), ("scope", "all_linear")):
+    for key, value in (("bits", 3), ("bits", 4.91), ("scope", "all_linear")):    # any width and scope now
         other = {**EXL3, "quantization_config": {**EXL3["quantization_config"], key: value}}
         (tmp_path / "config.json").write_text(json.dumps(other))
-        with pytest.raises(ValueError, match="recipe book"):
+        glm5_next.check(tmp_path)
+
+
+def test_glm_reads_red_snow_and_refuses_what_its_kernels_do_not(tmp_path, capsys):
+    from tensorfold.families import glm5_next
+
+    (tmp_path / "config.json").write_text(json.dumps(RED_SNOW))
+    glm5_next.check(tmp_path)
+    assert "experimental" in capsys.readouterr().out
+    families.require_readable(families.detect(tmp_path), RED_SNOW, "cuda")
+    for key, value, why in (("codebook", "3inst", "codebook '3inst'"), ("codebook", "mcg2", "codebook 'mcg2'"),
+                            ("bits", 9, "average bits 9"), ("head_bits", 9, "head_bits 9"),
+                            ("mtp_bits", 4.5, "mtp_bits 4.5"), ("bits", "mixed", "bits 'mixed'")):
+        other = {**RED_SNOW, "quantization_config": {**RED_SNOW["quantization_config"], key: value}}
+        (tmp_path / "config.json").write_text(json.dumps(other))
+        with pytest.raises(ValueError) as refused:
             glm5_next.check(tmp_path)
+        message = str(refused.value)
+        assert why in message and "RED-SNOW" in message and "recipe book" in message, message
+
+
+def _exl3_shard(path, groups):
+    """A safetensors file of EXL3 groups: prefix -> (bits, codebook marker or None), K = N = 128."""
+
+    import struct
+
+    header, offset, blobs = {}, 0, []
+    for prefix, (bits, marker) in groups.items():
+        parts = {"trellis": ("I16", [8, 8, 16 * bits]), "suh": ("F16", [128]), "svh": ("F16", [128])}
+        if marker:
+            parts[marker] = ("I32", [])
+        for part, (dtype, shape) in parts.items():
+            size = 2 if dtype != "I32" else 4
+            for v in shape:
+                size *= v
+            header[f"{prefix}.{part}"] = {"dtype": dtype, "shape": shape, "data_offsets": [offset, offset + size]}
+            blobs.append(bytes(size))
+            offset += size
+    text = json.dumps(header).encode()
+    path.write_bytes(struct.pack("<Q", len(text)) + text + b"".join(blobs))
+    return list(header)
+
+
+def test_glm_scans_a_complete_exl3_checkpoints_headers(tmp_path, capsys):
+    from tensorfold.families import glm5_next
+
+    config = {**RED_SNOW, "text_config": {"num_hidden_layers": 1}}
+    (tmp_path / "config.json").write_text(json.dumps(config))
+
+    def write(groups):
+        names = _exl3_shard(tmp_path / "model-00001-of-00001.safetensors", groups)
+        index = {"weight_map": {n: "model-00001-of-00001.safetensors" for n in names}}
+        (tmp_path / "model.safetensors.index.json").write_text(json.dumps(index))
+
+    write({"model.language_model.layers.0.mlp.experts.0.down_proj": (4, "mul1"),
+           "model.language_model.layers.0.self_attn.o_proj": (7, "mul1"), "lm_head": (8, "mul1")})
+    glm5_next.check(tmp_path)
+    out = capsys.readouterr().out
+    assert "3 in the mul1 codebook (1 routed experts' projections, 2 dense)" in out
+    assert "4-bit x1, 7-bit x1, 8-bit x1; head 8-bit" in out
+    for groups, why in (({"lm_head": (8, "mul1"), "model.language_model.layers.0.self_attn.o_proj": (4, None)},
+                         "3inst/mul1 codebook"),         # a 3inst tensor beside mul1 ones
+                        ({"lm_head": (9, "mul1")}, "do not parse")):
+        write(groups)
+        with pytest.raises(ValueError, match=why):
+            glm5_next.check(tmp_path)
+    (tmp_path / "model-00001-of-00001.safetensors").unlink()  # before the download: config.json alone
+    glm5_next.check(tmp_path)
 
 
 def test_unknown_model_types_point_to_the_recipe_book(tmp_path):

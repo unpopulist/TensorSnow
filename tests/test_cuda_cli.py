@@ -173,8 +173,10 @@ def test_serve_parses_the_kv_cache_flag():
     assert cli.build_parser().parse_args(["serve", "owner/model", "--kv-dtype", "int8"]).kv_dtype == "int8"
     assert cli.build_parser().parse_args(["serve", "owner/model", "--kv-dtype", "int4"]).kv_dtype == "int4"
     assert cli.build_parser().parse_args(["serve", "owner/model", "--mtp-confidence", "0.6"]).mtp_confidence == 0.6
+    # fp8: GLM-5.3-Flash's DSA cache (TF_GLM_KV=fp8); CUDA_KV_DTYPES keeps it from the families without one
+    assert cli.build_parser().parse_args(["serve", "owner/model", "--kv-dtype", "fp8"]).kv_dtype == "fp8"
     with pytest.raises(SystemExit):
-        cli.build_parser().parse_args(["serve", "owner/model", "--kv-dtype", "fp8"])
+        cli.build_parser().parse_args(["serve", "owner/model", "--kv-dtype", "fp4"])
 
 
 @pytest.mark.torch
@@ -201,6 +203,15 @@ def test_kv_dtype_reaches_only_the_families_that_declare_it(tmp_path, monkeypatc
                                   mtp_drafts=None, name="", model=str(tmp_path), kv_dtype="int8")
         with pytest.raises(ValueError, match="KV cache, not --kv-dtype int8"):
             cli._check_serve_options(args, SimpleNamespace(title=module.TITLE, package=module), "cuda")
+    # fp8 (TF_GLM_KV=fp8) is GLM-5.3-Flash's alone
+    assert glm5_next.CUDA_KV_DTYPES == ("bf16", "fp8")
+    fp8 = argparse.Namespace(tp=1, rank=0, master="", master_port=29551, no_drafts=True, drafter="none",
+                             mtp_drafts=None, name="", model=str(tmp_path), kv_dtype="fp8")
+    cli._check_serve_options(fp8, SimpleNamespace(title=glm5_next.TITLE, package=glm5_next), "cuda")
+    with pytest.raises(ValueError, match="KV cache, not --kv-dtype fp8"):
+        cli._check_serve_options(fp8, SimpleNamespace(title=qwen3_5.TITLE, package=qwen3_5), "cuda")
+    with pytest.raises(ValueError, match="kv-dtype int8"):
+        glm5_next.cuda_engine(tmp_path, tp=2, master="192.0.2.10", kv_dtype="int8")
     assert not made[1:]
 
 

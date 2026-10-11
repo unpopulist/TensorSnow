@@ -23,17 +23,19 @@ class _Snap:
         self.ids, self.need, self.states = list(ids), need, 5
         self.rows, self.nbytes = None, 0
         self.mtp_len, self.drafter_end = len(self.ids), len(self.ids)
+        self.drafter_rows = None
+        self.key, self.images = list(ids), False
 
 
 def _engine(monkeypatch, cells, logits):
-    def save_rows(e, snap):
+    def save_rows(e, snap, drafter=None):    # drafter: 0015's shared-state window
         snap.rows, snap.nbytes, snap.drafter_end = list(cells), snap.need, -1
 
     def prompt_logits(e, prompt):
         cells[:] = ["decision", *prompt]
         return logits
 
-    decode = SimpleNamespace(row_bytes=lambda e, s: s.need, save_rows=save_rows,
+    decode = SimpleNamespace(row_bytes=lambda e, s, drafter=None: s.need, save_rows=save_rows,
                              snapshot_bytes=lambda s: s.states + (s.nbytes if s.rows is not None else 0))
     monkeypatch.setitem(sys.modules, "tensorfold.families.glm5_next.cuda.decode", decode)
     monkeypatch.setitem(sys.modules, "tensorfold.families.glm5_next.cuda.score",

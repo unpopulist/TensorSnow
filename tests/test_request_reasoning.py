@@ -147,7 +147,8 @@ def test_explicit_thinking_overrides_none_and_preserves_default(default_effort, 
     ("{# 'low' 'high' #}", "xhigh", "xhigh"),               # GLM renders xhigh as its own Max; leave the name
     ("{# 'low' 'high' #}", "none", "none"),
     ("{# 'low' 'high' 'max' #}", "max", "max"),              # the template names max, so the name stays
-    ("{# 'low' 'high' 'max' #}", "medium", "high"),
+    ("{# 'low' 'high' 'max' #}", "medium", "medium"),        # a template naming max maps all but low/high to it
+                                                             # itself (else 'max'); the effort passes through
     ("", "high", "xhigh"),
     ("", "max", "xhigh"),
 ])
@@ -180,7 +181,9 @@ def test_glm_omitted_effort_stays_the_template_default_and_a_medium_default_is_h
     assert template.render(reasoning_effort="medium") == "max"
     for effort in ("minimal", "low", "medium", "high", "xhigh", "max"):
         heard = coerce_effort(effort, levels)
-        assert template.render(reasoning_effort=heard) == {"minimal": "low", "low": "low", "medium": "high",
+        # the template names max, so TF passes the effort through and the template's else->'max' maps all but
+        # low/high to Max (matching the other GLM-5.3 server here); only low and high render as themselves
+        assert template.render(reasoning_effort=heard) == {"minimal": "max", "low": "low", "medium": "max",
                                                            "high": "high", "xhigh": "max", "max": "max"}[effort]
 
     app = make_app(enable_thinking=True, reasoning_effort="medium")
@@ -299,15 +302,17 @@ def test_glm_and_qwen_templates_hear_the_nearest_named_level():
     assert qwen_levels == frozenset({"low", "medium", "xhigh"})
     glm_template = jinja2.Environment().from_string(glm)
     qwen_template = jinja2.Environment().from_string(qwen)
-    assert glm_template.render(reasoning_effort=coerce_effort("medium", glm_levels)) == "high"
-    assert glm_template.render(reasoning_effort=coerce_effort("minimal", glm_levels)) == "low"
+    # GLM-5.3 names max: TF passes the effort through and the template's own `else 'max'` maps all but low/high to
+    # Max, matching the other GLM-5.3 server on this box (which sets default high and maps medium/minimal to Max).
+    assert glm_template.render(reasoning_effort=coerce_effort("medium", glm_levels)) == "max"
+    assert glm_template.render(reasoning_effort=coerce_effort("minimal", glm_levels)) == "max"
     assert glm_template.render(reasoning_effort=coerce_effort("xhigh", glm_levels)) == "max"
     assert glm_template.render(reasoning_effort=coerce_effort("max", glm_levels)) == "max"
     assert qwen_template.render(reasoning_effort=coerce_effort("high", qwen_levels)) == "xhigh"
     assert qwen_template.render(reasoning_effort=coerce_effort("max", qwen_levels)) == "xhigh"
     assert qwen_template.render(reasoning_effort=coerce_effort("minimal", qwen_levels)) == "low"
     assert qwen_template.render(reasoning_effort=coerce_effort("medium", qwen_levels)) == "medium"
-    assert heard_effort(None, "medium", glm_levels) == "high"
+    assert heard_effort(None, "medium", glm_levels) == "medium"   # GLM's template renders it as Max
     assert heard_effort(None, "high", qwen_levels) == "xhigh"
     assert heard_effort(None, "medium", qwen_levels) == "medium"
 

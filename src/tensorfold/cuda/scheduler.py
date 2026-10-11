@@ -10,6 +10,7 @@ from typing import Any, Callable
 
 from .memory_gate import NoRoom
 from .streams import Stream
+from tensorfold.server.errors import CapacityError  # TFCAP-0075
 
 
 class Waiting(queue.PriorityQueue):
@@ -39,6 +40,12 @@ class Waiting(queue.PriorityQueue):
 
         super().put((2, next(self._order), None))
 
+    def foreground_count(self) -> int:
+        # TFCAP-0075: queued background streams never consume admission slots; scheduling prefers
+        # foreground, so only foreground waiters count against the cap.
+        with self.mutex:
+            return sum(1 for _p, _o, (s, _b) in self.queue if not s.background)
+
     def foreground(self) -> bool:
         """Whether a foreground request waits."""
 
@@ -47,9 +54,16 @@ class Waiting(queue.PriorityQueue):
 
 
 class Scheduler:
-    def __init__(self, decoder: Any, *, max_streams: int = 4) -> None:
+    def __init__(self, decoder: Any, *, max_streams: int = 4,
+                 max_in_system: int | None = None) -> None:
         self.decoder = decoder
         self.max_streams = max_streams
+        # TFCAP-0075: the mechanism is unconditional; the limit is configuration, as in vLLM — its
+        # check_admission runs on every request while max_num_queued_reqs/max_num_queued_tokens
+        # default to None ("bounds vLLM's otherwise unbounded request queue", "a coarse capacity
+        # valve"). None queues, as every scheduler always has; a cap turns saturation into a
+        # refusal with a retry hint instead of invisible stacking.
+        self.max_in_system = max_in_system
         self.waiting = Waiting()
         self.held: tuple | None = None               # a request waiting for memory, admitted before any other
         self.boxes: dict[int, queue.Queue] = {}
@@ -66,10 +80,34 @@ class Scheduler:
         self.thread.join()
         self.decoder = None
 
+    def _check_admission(self, background: bool) -> None:
+        # TFCAP-0075: refusal at saturation. Background requests bypass: they yield and queue by design.
+        if background or self.max_in_system is None:
+            return
+        if self.decoder.live() + self.waiting.foreground_count() >= self.max_in_system:
+            raise CapacityError("all serving lanes are busy; retry shortly")
+
+    def _relay_token(self, emit: Callable[[list[int]], bool | None], value: list[int], cancel: list[bool]) -> None:
+        # TFCAP-0076: a True return (the client left, or a stop string) or a delivery failure ends
+        # the stream. The old code let an exception escape the relay and the lane leaked until
+        # generation ended — minutes of decode into a queue nobody reads. Fires at most once per
+        # stream: cancel latches and later tokens skip the emit. The GLM submit loop's equivalent,
+        # with cleanup-before-error for its rank coordination, is patch 0073 (PR #51).
+        stop = False
+        if not cancel[0]:
+            try:
+                stop = emit(value)
+            except Exception as exc:
+                print(f"[tensorfold] stream aborted: emit failed: {exc!r}", flush=True)
+                stop = True
+        if stop:
+            cancel[0] = True
+
     def submit(self, prompt: list[int], count: int, sampling: Any, draft: bool,
                emit: Callable[[list[int]], bool | None], stop_eos: bool = True, *, vision: Any = None,
                constraint: Any = None, background: bool = False, probabilities: Any = None) -> dict:
         """Decode one request; ``emit`` runs on the calling thread and returns True to stop. Returns its stats."""
+        self._check_admission(background)
 
         box: queue.Queue = queue.Queue()
         stream = Stream(list(prompt), max(1, count), sampling, draft=draft, stop_eos=stop_eos, vision=vision,
@@ -80,8 +118,7 @@ class Scheduler:
         while True:
             kind, value = box.get()
             if kind == "tokens":
-                if not cancel[0] and emit(value):
-                    cancel[0] = True                 # the client left: the stream ends after its next round
+                self._relay_token(emit, value, cancel)
             elif kind == "error":
                 raise value
             else:

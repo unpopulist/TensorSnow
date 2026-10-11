@@ -36,7 +36,7 @@ def allocations(monkeypatch):
     lang.constexpr = object
     triton = ModuleType("triton")
     triton.language = lang
-    triton.jit = lambda fn: fn
+    triton.jit = lambda fn=None, **kw: fn if fn is not None else (lambda f: f)   # @triton.jit and @triton.jit(...)
     triton.cdiv = lambda a, b: (a + b - 1) // b
     triton.next_power_of_2 = lambda n: 1 << (n - 1).bit_length()
     monkeypatch.setitem(sys.modules, "triton", triton)
@@ -247,7 +247,6 @@ def test_mla_exl3_scratch_and_buffers_are_budgeted(monkeypatch, allocations, mtp
                      importlib.import_module("tensorfold.cuda.exl3.experts")]:
         monkeypatch.setattr(m, "torch", fake)
     monkeypatch.setattr(mods[2], "ENABLED", True)
-    exl3_mm = mods[-1]
     text = {"hidden_size": 4096, "num_attention_heads": 64, "num_hidden_layers": 4,
             "layer_types": ["linear_attention", "full_attention"] * 2, "linear_attn_config": {"num_heads": 64},
             "qk_nope_head_dim": 192, "qk_rope_head_dim": 64, "v_head_dim": 256, "vocab_size": 154880,
@@ -260,12 +259,9 @@ def test_mla_exl3_scratch_and_buffers_are_budgeted(monkeypatch, allocations, mtp
     layers = [SimpleNamespace(index=i, kind="kda" if i % 2 == 0 else "dsa",
                               kda=SimpleNamespace(proj=SimpleNamespace(n=3 * 32 * 128 + 256 + 32))) for i in range(4)]
     weights = SimpleNamespace(cfg=cfg, world=2, device="cpu", layers=layers, meta={"long_context": True},
-                              mtp=SimpleNamespace() if mtp else None, head=SimpleNamespace(n=154880 // 2))
-    slots, d, width = 9, 4096, 1024
-    for rows in (8, 64, geometry.PREFILL_ROWS):
-        arrays.clear()
-        exl3_mm.Scratch(rows, slots, d, width, "cpu")
-        assert bytes_in(arrays) == geometry.exl3_expert_scratch(rows, slots, d, width), rows
+                              mtp=SimpleNamespace() if mtp else None, head=SimpleNamespace(n=154880 // 2),
+                              draft_head=None)
+    # exl3_expert_scratch follows the universal kernel's Scratch now (tests/test_glm_exl3_budget.py pins it)
     arrays.clear()
     cap = 1 << 20
     mod.Buffers(weights, 64, cap)

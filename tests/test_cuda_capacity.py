@@ -9,6 +9,7 @@ import pytest
 
 from tensorfold import cli
 from tensorfold.families.glm5_next.cuda import LATENT
+from tensorfold.families.glm5_next.cuda.latent import SPARSE_ONEPASS   # the engine's geometry (Mia's 0028)
 
 
 def checkpoint(path, config, tensors):
@@ -140,7 +141,7 @@ def fake_runtime(monkeypatch):
         prefix = f"tensorfold.families.{family}.cuda"
         weights = SimpleNamespace(load=load, draft_token_ids=lambda *a: None,
                                   Config=SimpleNamespace(read=lambda *a: SimpleNamespace(dense_limit=2051, mtp_layers=1,
-                                                                                         layers=4)))
+                                                                                         layers=4, eos=(1000,))))
         monkeypatch.setitem(sys.modules, prefix + ".weights", weights)
         monkeypatch.setitem(sys.modules, prefix + ".decode", SimpleNamespace(Engine=None))
     import torch.distributed as dist
@@ -195,7 +196,7 @@ def test_real_constructors_shrink_default_and_refuse_explicit_before_loading(tmp
     calls, capacity = fake_runtime
     from tensorfold.cuda.geometry import gdn_geometry, mla_geometry
     text = small_config()
-    geometry = (mla_geometry(text, world, 8, latent=LATENT) if family == "mla" else
+    geometry = (mla_geometry(text, world, 8, latent=LATENT, onepass=SPARSE_ONEPASS) if family == "mla" else
                 gdn_geometry(text, world, 1 if family == "indexed" else 12, indexed=family == "indexed"))
     budget = geometry.needed(12000) + 32768
     monkeypatch.setattr(capacity, "available_bytes", lambda t: budget)
@@ -293,7 +294,7 @@ def test_actual_distributed_startup_agrees_on_smaller_rank_before_loading(tmp_pa
 
     checkpoint(tmp_path, small_config(), HEAD)
     calls, capacity = fake_runtime
-    geom = (mla_geometry(small_config(), 2, 8, latent=LATENT) if family == "mla" else
+    geom = (mla_geometry(small_config(), 2, 8, latent=LATENT, onepass=SPARSE_ONEPASS) if family == "mla" else
             gdn_geometry(small_config(), 2, 1, indexed=True, kept=5) if family == "indexed" else
             gdn_geometry(small_config(), 2, 12, rows=12, prompt=4096))     # the 27B engine's, prompt chunks on a GB10
     transform = split_weights(rule) if family == "mla" else indexed_weights(2, False) if family == "indexed" else linear_weights

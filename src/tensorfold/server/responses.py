@@ -106,10 +106,12 @@ def store_for(app: Any) -> Store:
 # -- HTTP -------------------------------------------------------------------------------------
 
 
-def _send(handler: Any, status: int, payload: dict[str, Any]) -> None:
+def _send(handler: Any, status: int, payload: dict[str, Any], headers: dict[str, str] | None = None) -> None:
     data = json.dumps(payload).encode()
     try:
         handler.send_response(status)
+        for name, value in (headers or {}).items():  # a capacity refusal's Retry-After, passed on from the chat route
+            handler.send_header(name, value)
         handler.send_header("Content-Type", "application/json")
         handler.send_header("Content-Length", str(len(data)))
         if handler.close_connection:                 # so a pooling client does not reuse the socket
@@ -131,6 +133,7 @@ class Wire:
     def __init__(self, opened: Callable[[], None], event: Callable[[dict[str, Any] | None], None]) -> None:
         self.opened, self.event = opened, event
         self.status: int | None = None
+        self.retry_after: str | None = None         # the chat route's Retry-After (a 429 capacity refusal)
         self.stream = False
         self.data = bytearray()
 
@@ -143,6 +146,8 @@ class Wire:
             head = bytes(self.data[:end]).decode("latin-1").split("\r\n")
             del self.data[:end + 4]
             self.status = int(head[0].split()[1])
+            self.retry_after = next((v.strip() for k, _, v in (line.partition(":") for line in head[1:])
+                                     if k.lower() == "retry-after"), None)
             kinds = [v.strip() for k, _, v in (line.partition(":") for line in head[1:]) if k.lower() == "content-type"]
             self.stream = self.status == 200 and bool(kinds) and kinds[0].startswith("text/event-stream")
             if self.stream:
@@ -160,6 +165,11 @@ class Wire:
 
     def flush(self) -> None:
         pass
+
+    def headers(self) -> dict[str, str] | None:
+        """The headers a refusal passes on to the caller's client (Retry-After)."""
+
+        return {"Retry-After": self.retry_after} if self.retry_after else None
 
 
 def _run_chat(handler: Any, body: dict[str, Any], wire: Wire) -> None:
@@ -227,7 +237,7 @@ def post(handler: Any, app: Any) -> None:
             payload = json.loads(bytes(wire.data) or b"{}")
         except ValueError:
             payload = {"error": {"message": bytes(wire.data).decode("utf-8", "replace")}}
-        return _send(handler, wire.status, payload)
+        return _send(handler, wire.status, payload, wire.headers())
     _send(handler, 200, reply.completion(json.loads(bytes(wire.data))))
 
 

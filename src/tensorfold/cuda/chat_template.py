@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import os
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -19,8 +20,12 @@ class ChatTemplate:
         from jinja2.sandbox import ImmutableSandboxedEnvironment
 
         cfg = json.loads((model_dir / "tokenizer_config.json").read_text())
-        source_path = model_dir / "chat_template.jinja"
-        source = source_path.read_text() if source_path.exists() else cfg["chat_template"]
+        override = os.environ.get("TF_GLM_CHAT_TEMPLATE")           # --chat-template: an alternate template, the
+        if override:                                               # checkpoint on disk is never modified
+            source = Path(override).read_text()
+        else:
+            source_path = model_dir / "chat_template.jinja"
+            source = source_path.read_text() if source_path.exists() else cfg["chat_template"]
 
         def tojson(x, ensure_ascii=False, indent=None, separators=None, sort_keys=False):
             return json.dumps(x, ensure_ascii=ensure_ascii, indent=indent, separators=separators, sort_keys=sort_keys)

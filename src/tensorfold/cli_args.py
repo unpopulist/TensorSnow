@@ -64,10 +64,14 @@ def build_parser(handlers: dict[str, Callable[[argparse.Namespace], int]]) -> ar
                                  "model's generation config, else 0: off)")
     generation.add_argument("--thinking", action=argparse.BooleanOptionalAction, default=True,
                             help="open a think block when the chat template supports it")
-    generation.add_argument("--reasoning-effort", choices=("low", "medium", "high", "xhigh"), default=None,
+    generation.add_argument("--reasoning-effort", choices=("low", "medium", "high", "xhigh", "max"), default=None,
                             help="default effort when a request omits one. An unnamed level maps to the nearest "
                                  "level the template names, and a tie takes the higher one. This flag uses that "
-                                 "rule. xhigh stays xhigh, so GLM-5.3 renders it as Max")
+                                 "rule. xhigh stays xhigh, so GLM-5.3 renders it as Max. A template that names max "
+                                 "(GLM-5.3: low, high, max) renders low/high through and everything else as Max")
+    generation.add_argument("--chat-template", default=None, metavar="PATH",
+                            help="render prompts with this chat template file instead of the checkpoint's "
+                                 "(also TF_GLM_CHAT_TEMPLATE). The checkpoint on disk is never modified. CUDA only")
     generation.add_argument("--thinking-budget", type=int, default=0,
                             help="most thinking tokens before the server closes the think block (0: no limit)")
 
@@ -96,8 +100,18 @@ def build_parser(handlers: dict[str, Callable[[argparse.Namespace], int]]) -> ar
                             "on CUDA with --parallel 2 or more: the prompt states its concurrent decoder keeps "
                             "(default 3; one GPU keeps them while memory lasts, two ranks reserve a window each)")
     speed.add_argument("--spill-gib", type=float, default=0.0,
-                       help="write evicted conversation prefixes to disk, up to this many GiB, and read them back on "
-                            "demand instead of prefilling again (0: off; needs --snapshot-dir)")
+                       help="write conversation prefixes to disk, up to this many GiB (a rank on CUDA with --tp 2 or "
+                            "more), and read them back on demand instead of prefilling again (0: off; needs "
+                            "--snapshot-dir; CUDA: GLM-5.3-Flash)")
+    speed.add_argument("--spill-highwater", type=float, default=0.70,
+                       help="CUDA spill: past this fraction of the prompt-state memory, the states eviction would take "
+                            "next are written in the background (1.0: written only when evicted)")
+    speed.add_argument("--spill-min-tokens", type=int, default=8192,
+                       help="CUDA spill: shorter prompt states are not written")
+    speed.add_argument("--spill-min-free-gib", type=float, default=50.0,
+                       help="CUDA spill: no write leaves less than this much disk free (on any rank)")
+    speed.add_argument("--spill-keep-builds", type=int, default=1,
+                       help="CUDA spill: other builds' stored prompts (other directories) kept at start")
     speed.add_argument("--snapshot-dir", default=str(Path.home() / ".cache" / "tensorfold" / "prefix-snapshots"),
                        help="where system-block and conversation snapshots are kept ('none': in memory only)")
     speed.add_argument("--max-snapshots", type=int, default=3, help="system-block snapshots loaded at start")
@@ -135,9 +149,11 @@ def build_parser(handlers: dict[str, Callable[[argparse.Namespace], int]]) -> ar
                       help="with --tp 2/4: this machine's rank; rank 0 serves HTTP, others follow it")
     cuda.add_argument("--master", default="", help="with --tp 2/4: rank 0's address on the link between the ranks")
     cuda.add_argument("--master-port", type=int, default=29551, help="with --tp 2/4: rank 0's rendezvous port")
-    cuda.add_argument("--kv-dtype", choices=("bf16", "int8", "int4"), default="bf16",
+    cuda.add_argument("--kv-dtype", choices=("bf16", "int8", "int4", "fp8"), default="bf16",
                       help="KV cache: bf16 (the default), int8, or int4. Quantized keys and values use one "
-                           "fp16 scale per 32 values (changes the output; Flash Next on CUDA only)")
+                           "fp16 scale per 32 values (changes the output; Flash Next on CUDA only). fp8: GLM-5.3-Flash "
+                           "on CUDA's DSA latent cache and indexer pooled keys as e4m3 rows with a power-of-two scale "
+                           "each (TF_GLM_KV=fp8; lossy, about half the cache bytes, a longer window)")
     cuda.add_argument("--prefill-fp8", action=argparse.BooleanOptionalAction, default=argparse.SUPPRESS,
                       help="prompt matmuls take FP8 (e4m3) activations, one scale a row, where the checkpoint has an "
                            "FP8 prompt kernel (Qwen3.8 27B and Qwen3.6 MLX 4-bit, NVFP4 checkpoints' FP8 and MXFP8 "

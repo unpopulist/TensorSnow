@@ -7,7 +7,7 @@ from typing import Any
 
 from tensorfold.server.errors import RequestError
 
-LIMIT = 32 * 1024**2
+LIMIT = 96 * 1024**2                # up to 50 pictures or 4 clips as data URLs (GLM --vision)
 _METADATA_LIMIT = 65536
 
 

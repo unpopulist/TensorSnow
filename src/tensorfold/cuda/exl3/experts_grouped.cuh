@@ -7,6 +7,8 @@
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
 
+#include "experts_epilogue.cuh"
+
 namespace tf_exl3x {
 
 // Two codebook values (CB 0 3inst, 1 mcg, 2 mul1) as a half2, bit-identical to ExLlamaV3's decode_3inst_2<cb>.
@@ -181,18 +183,95 @@ __device__ __forceinline__ void warp_tiles(const uint32_t* __restrict__ T, int N
     }
 }
 
+// 16 bytes of trellis words, read once (no L1 allocation). asm volatile keeps the load where it stands relative to
+// the (volatile) mma, so the number of k tiles in flight is what the code says.
+__device__ __forceinline__ uint4 ldg_nc_v4(const uint32_t* p) {
+    uint4 v;
+    asm volatile("ld.global.nc.L1::no_allocate.v4.u32 {%0,%1,%2,%3}, [%4];"
+                 : "=r"(v.x), "=r"(v.y), "=r"(v.z), "=r"(v.w)
+                 : "l"(p));
+    return v;
+}
+
+// warp_tiles with 16-byte loads (TF_EXL3_LOADS=nc; after Mia's 0047, adapted from jayleaton/glm53-tensorfold-spark
+// patches/0580, Apache-2.0, Copyright 2026 Jay Leaton): a k tile's NT tiles are NT * TW contiguous words, read as
+// 16-byte ld.global.nc pieces (lane l: pieces l, l + 32, ..), PF k tiles ahead, through the warp's staging area
+// (NT * TW words of shared memory) and read back as word l * 32 + lane of each tile -- warp_tiles' own words, decode
+// and mma chain, so the same bits. 32-bit loads of a 5-bit tile (160 bytes) straddle 128-byte lines and leave a
+// 32-byte tail load; measured on RED-SNOW's 5-bit gate/up the kernel went from ~181 to ~225 GB/s.
+template <int CB, int K2, int NT, int PF>
+__device__ __forceinline__ void warp_tiles_v4(const uint32_t* __restrict__ T, int NTILES, int kt0, int nkt, int nt0,
+                                              const half* x0, const half* x1, bool ok0, bool ok1, int lane,
+                                              float (&acc)[NT][2][4], uint32_t* stage) {
+    constexpr int TW = Fmt<K2>::TW, LW = Fmt<K2>::LW;
+    constexpr int NV = NT * TW / 4;                    // 16-byte pieces of a k tile's NT tiles
+    constexpr int VL = (NV + 31) / 32;                 // pieces a lane
+    static_assert(NT * TW % 4 == 0, "a k tile's words come in whole 16-byte pieces");
+    const LaneMap<K2> map(lane);
+    const size_t kstride = (size_t)NTILES * TW;
+    const uint32_t* tp = T + ((size_t)kt0 * NTILES + nt0) * TW + 4 * lane;
+
+    uint4 rv[PF][VL];
+#pragma unroll
+    for (int d = 0; d < PF; ++d)
+        if (d < nkt)
+#pragma unroll
+            for (int v = 0; v < VL; ++v)
+                if (v * 32 + lane < NV) rv[d][v] = ldg_nc_v4(tp + d * kstride + 128 * v);
+
+    for (int ib = 0; ib < nkt; ib += PF) {
+#pragma unroll
+        for (int d = 0; d < PF; ++d) {
+            const int it = ib + d;
+            if (it < nkt) {
+                __syncwarp();                              // every lane has read the previous k tile back
+#pragma unroll
+                for (int v = 0; v < VL; ++v)
+                    if (v * 32 + lane < NV) *reinterpret_cast<uint4*>(stage + 128 * v + 4 * lane) = rv[d][v];
+                if (it + PF < nkt)                         // the slot's registers are free again
+#pragma unroll
+                    for (int v = 0; v < VL; ++v)
+                        if (v * 32 + lane < NV) rv[d][v] = ldg_nc_v4(tp + (size_t)(it + PF) * kstride + 128 * v);
+                const int k = (kt0 + it) * 16;
+                uint32_t a[4] = {load_pair(x0 + k, ok0), load_pair(x1 + k, ok1), load_pair(x0 + k + 8, ok0),
+                                 load_pair(x1 + k + 8, ok1)};
+                __syncwarp();
+                uint32_t w[NT][LW];
+#pragma unroll
+                for (int i = 0; i < NT; ++i)
+#pragma unroll
+                    for (int l = 0; l < LW; ++l)
+                        w[i][l] = ((TW % 32) == 0 || l * 32 + lane < TW) ? stage[i * TW + l * 32 + lane] : 0u;
+#pragma unroll
+                for (int i = 0; i < NT; ++i) {
+                    uint32_t b0[2], b1[2];
+                    decode_tile<CB, K2>(w[i], map, lane, b0, b1);
+                    mma16816(acc[i][0], a, b0);
+                    mma16816(acc[i][1], a, b1);
+                }
+            }
+        }
+    }
+    __syncwarp();                                          // the staging area is red[warp] again after this
+}
+
 // The K2 values an instance covering [LO, HI] compiles (half-bits 2..16).
 __host__ __device__ constexpr bool k2_supported(int k2) {
     return k2 >= 2 && k2 <= 16;
 }
 
 // Program (expert u, n block, split and member tile): up to 16 members times W_q over the split's K range; warps added in order.
-template <int CB, int NT, int W, int PF, int LO, int HI>
+// LD16: the trellis words through warp_tiles_v4 (16-byte loads, the same words, chains and sums).
+// FUSE (down, SK = 1, NT * 16 = 128 columns: one Hadamard block, after Mia's 0016): the down epilogue's arithmetic on
+// the block's own sums (v = 0 + the warps' sum), Y written directly, no Z round trip and no epilogue launch.
+template <int CB, int NT, int W, int PF, int LO, int HI, bool FUSE = false, bool LD16 = false>
 __global__ void __launch_bounds__(W * 32) grouped_kernel(
     const half* __restrict__ X0, const half* __restrict__ X1, const int64_t* __restrict__ TP0,
     const int64_t* __restrict__ TP1, const int* __restrict__ K2_0, const int* __restrict__ K2_1,
     const int* __restrict__ uids, const int* __restrict__ ucount, const int* __restrict__ members,
-    float* __restrict__ Z, int K, int N, int P, int SK, int maxm, int slots) {
+    float* __restrict__ Z, int K, int N, int P, int SK, int maxm, int slots, const half* __restrict__ svh_d = nullptr,
+    float* __restrict__ Y = nullptr) {
+    static_assert(!FUSE || NT * 16 == 128, "the fused down epilogue needs one 128-column block a program");
     const int u = blockIdx.x;
     if (u >= ucount[0]) return;
     const int MT = (maxm + 15) / 16;
@@ -223,6 +302,9 @@ __global__ void __launch_bounds__(W * 32) grouped_kernel(
     const int kt0 = split * per_split + warp * per_warp;
     const int nt0 = blockIdx.y * NT;
 
+    // warps' partial sums through shared memory, added in warp order; under LD16 each warp's slice is first its
+    // staging area (NT * TW <= 16 * NT * 16 words)
+    __shared__ __align__(16) float red[W][16][NT * 16];
     float acc[NT][2][4];
 #pragma unroll
     for (int i = 0; i < NT; ++i)
@@ -234,7 +316,10 @@ __global__ void __launch_bounds__(W * 32) grouped_kernel(
     switch (k2) {
 #define TF_EXL3X_CASE(K2_)                                                                                      \
     case K2_:                                                                                                   \
-        if constexpr (K2_ >= LO && K2_ <= HI)                                                                   \
+        if constexpr (K2_ >= LO && K2_ <= HI && LD16)                                                           \
+            warp_tiles_v4<CB, K2_, NT, PF>(T, NTILES, kt0, per_warp, nt0, x0, x1, r0 >= 0, r1 >= 0, lane, acc,  \
+                                           reinterpret_cast<uint32_t*>(&red[warp][0][0]));                     \
+        else if constexpr (K2_ >= LO && K2_ <= HI)                                                              \
             warp_tiles<CB, K2_, NT, PF>(T, NTILES, kt0, per_warp, nt0, x0, x1, r0 >= 0, r1 >= 0, lane, acc);    \
         else                                                                                                    \
             __trap();                                                                                           \
@@ -259,8 +344,6 @@ __global__ void __launch_bounds__(W * 32) grouped_kernel(
             __trap();
     }
 
-    // warps' partial sums through shared memory, added in warp order
-    __shared__ float red[W][16][NT * 16];
 #pragma unroll
     for (int i = 0; i < NT; ++i)
 #pragma unroll
@@ -272,6 +355,22 @@ __global__ void __launch_bounds__(W * 32) grouped_kernel(
             red[warp][g + 8][col + 1] = acc[i][h][3];
         }
     __syncthreads();
+    if constexpr (FUSE) {
+        for (int row = warp; row < 16; row += W) {
+            const int r = rows_sh[row];
+            if (r < 0) break;                                  // members come first
+            float v[4];
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                float s = red[0][row][4 * lane + j];
+#pragma unroll
+                for (int w = 1; w < W; ++w) s += red[w][row][4 * lane + j];
+                v[j] = 0.f + s;                                // down_epilogue_kernel's sum over the one split
+            }
+            down_finish(v, lane, e, N, nt0 * 16 + 4 * lane, svh_d, Y + (size_t)r * N);
+        }
+        return;
+    }
     for (int idx = threadIdx.x; idx < 16 * NT * 16; idx += W * 32) {
         const int row = idx / (NT * 16), col = idx % (NT * 16);
         const int r = rows_sh[row];
@@ -319,16 +418,31 @@ struct GroupedArgs {
     int K, N, P, SK, maxm, slots;
     int nexp_max;        // grid.x (upper bound of distinct experts)
     int mats, nt, warps, pf, lo, hi;
+    int ld;              // 1: 16-byte trellis loads (warp_tiles_v4; every trellis 16-byte aligned)
+    const half* svh_d;   // non-null: the fused down epilogue into y
+    float* y;
 };
 
 template <int CB>
 void grouped_launch(const GroupedArgs& a, cudaStream_t stream) {
     const int MT = (a.maxm + 15) / 16;
     dim3 grid((unsigned)a.nexp_max, (unsigned)(a.N / (16 * a.nt)), (unsigned)(a.mats * a.SK * MT));
+#define TF_LAUNCH_LD(NT_, W_, PF_, LO_, HI_, LD_)                                                               \
+    do {                                                                                                        \
+    if (a.svh_d && NT_ * 16 == 128)                                                                             \
+        grouped_kernel<CB, NT_, W_, PF_, LO_, HI_, NT_ * 16 == 128, LD_><<<grid, W_ * 32, 0, stream>>>(         \
+            a.x0, a.x1, a.tp0, a.tp1, a.k2_0, a.k2_1, a.uids, a.ucount, a.members, a.z, a.K, a.N, a.P, a.SK,    \
+            a.maxm, a.slots, a.svh_d, a.y);                                                                     \
+    else                                                                                                        \
+        grouped_kernel<CB, NT_, W_, PF_, LO_, HI_, false, LD_><<<grid, W_ * 32, 0, stream>>>(                   \
+            a.x0, a.x1, a.tp0, a.tp1, a.k2_0, a.k2_1, a.uids, a.ucount, a.members, a.z, a.K, a.N, a.P, a.SK,    \
+            a.maxm, a.slots);                                                                                   \
+    } while (0)
 #define TF_LAUNCH(NT_, W_, PF_, LO_, HI_)                                                                       \
-    grouped_kernel<CB, NT_, W_, PF_, LO_, HI_><<<grid, W_ * 32, 0, stream>>>(                                   \
-        a.x0, a.x1, a.tp0, a.tp1, a.k2_0, a.k2_1, a.uids, a.ucount, a.members, a.z, a.K, a.N, a.P, a.SK, a.maxm, \
-        a.slots)
+    do {                                                                                                        \
+    if (a.ld) TF_LAUNCH_LD(NT_, W_, PF_, LO_, HI_, true);                                                      \
+    else TF_LAUNCH_LD(NT_, W_, PF_, LO_, HI_, false);                                                           \
+    } while (0)
 #define TF_RANGES(NT_, W_, PF_)                                                                                 \
     if (a.lo == 8 && a.hi == 8) TF_LAUNCH(NT_, W_, PF_, 8, 8);                                                  \
     else if (a.lo >= 2 && a.hi <= 10) TF_LAUNCH(NT_, W_, PF_, 2, 10);                                           \
@@ -339,6 +453,7 @@ void grouped_launch(const GroupedArgs& a, cudaStream_t stream) {
     else TORCH_CHECK(false, "unsupported tile setting nt=", a.nt, " warps=", a.warps, " pf=", a.pf);
 #undef TF_RANGES
 #undef TF_LAUNCH
+#undef TF_LAUNCH_LD
 }
 
 template <int CB>

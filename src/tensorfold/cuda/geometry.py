@@ -10,6 +10,7 @@ from .capacity import Geometry, Weights, headers, itemsize
 PREFILL_ROWS = 2048     # a prompt chunk's rows: Flash Next and GLM keep buffers of this many rows
 PROMPT_SHARE = 32       # a dense prompt chunk's arrays take at most this fraction of the GPU's memory
 PREFILL_ATT_ROWS = 256  # Flash Next's prompt attention block
+MLA_DECODE_ROWS = 64    # GLM's decode windows the MLA estimate sizes buffers for (its verify windows: at most this)
 MLA_PROMPT_ATT_ROWS = 512   # GLM's prompt-chunk rows one dense latent attention call takes (forward.PROMPT_ATT_ROWS)
 MLA_SELECT_ROWS = 512       # GLM's prompt-chunk rows whose pool scores are held at once (sparse.SELECT_ROWS)
 
@@ -110,18 +111,31 @@ def indexed_weights(world: int, mtp: bool, mapped_tables: bool = True):
     return transform
 
 
+# the axis each split kind divides; GLM's fused q/k/v kinds (``fused3_*``: [q | k | v] -> [q_r | k_r | v_r]) halve
+# the same axis by the same amount as their plain kinds
+SPLIT_AXIS = {"row": 0, "col": -1, "dim1": 1, "fused3_row": 0, "fused3_dim1": 1}
+EXL3_PARTS = (".trellis", ".suh", ".svh", ".mcg", ".mul1")
+
+
 def split_weights(rule, world: int = 2):
+    """Per-rank bytes of a checkpoint split by ``rule`` (name -> drop / rep / a ``SPLIT_AXIS`` kind)."""
+
     def transform(name: str, info: dict) -> tuple[int, int]:
         kind = rule(name)
         if kind == "drop":
             return 0, 0
         shape = list(info["shape"])
         if not info.get("split") and kind != "rep":
-            axis = {"row": 0, "col": -1, "dim1": 1}[kind]
+            if kind not in SPLIT_AXIS or not shape:
+                raise ValueError(f"checkpoint tensor {name} {shape}: no split axis for kind {kind!r}")
+            axis = SPLIT_AXIS[kind]
             if shape[axis] % world:
                 raise ValueError(f"checkpoint tensor does not split evenly: {name}")
             shape[axis] //= world
-        if name.startswith("lm_head."):
+        # a head the rule copies whole (MLX / BF16 lm_head.weight, scales, biases) is cut to the rank's vocabulary
+        # rows at load; an EXL3 head is split by the rule itself (trellis dim1, svh rows), its suh and codebook scalar
+        # are copied
+        if name.startswith("lm_head.") and kind == "rep" and shape and not name.endswith(EXL3_PARTS):
             shape[0] //= world
         cast = name.endswith((".A_log", ".dt_bias", ".hc_attn_base", ".hc_attn_scale", ".hc_ffn_base",
                               ".hc_ffn_scale", ".e_score_correction_bias"))
@@ -244,16 +258,39 @@ def indexed_prompt_bytes(t: dict, rows: int, world: int = 1) -> int:
     return rows * _indexed_prefill_row(t, world, h, hk, hd, nv, dv, width, slots, moe)
 
 
-def exl3_expert_scratch(rows: int, slots: int, d: int, width: int) -> int:
-    """GLM's ``exl3_mm.Scratch`` for ``rows`` x ``slots`` pairs: fp16 rotated inputs and the fp32 split-K sums."""
+def exl3_expert_scratch(rows: int, slots: int, d: int, width: int, experts: int, prompt_rows: int | None = None) -> int:
+    """Bytes of the universal EXL3 expert kernel's ``Scratch`` (tensorfold/cuda/exl3/experts.py) for ``rows`` x
+    ``slots`` pairs P of ``experts`` routed experts (``width``: a rank's expert width): fp16 rotated inputs of gate/up
+    (2 x P x d) and down (P x width), the fp32 split-K partials (max(2 x sk_gu x width, sk_d x d) for the windows below
+    PROMPT_ROWS rows when the prompt kernel serves the rest, else for all P), the fp32 outputs (P x d) and the int32
+    grouping and prompt items (Mia's 0028, re-derived for the universal kernel); ``prompt_rows``: the scratch's own
+    crossover (``Scratch(prompt_rows=...)``, default PROMPT_ROWS)."""
+
+    from types import SimpleNamespace
+
+    from tensorfold.cuda.exl3.experts import PROMPT_PASS, PROMPT_ROWS, default_config, prompt_fits
 
     pairs = rows * slots
-    return 2 * pairs * d * 2 + pairs * width * 2 + 2 * 4 * pairs * max(width, d) * 4
+    gu, dn = default_config(d, width, True), default_config(width, d, False)
+    prompt_rows = PROMPT_ROWS if prompt_rows is None else prompt_rows
+    zp = min(pairs, (prompt_rows - 1) * slots) if prompt_fits(SimpleNamespace(cfg_gu=gu, cfg_d=dn), d, width) else pairs
+    maxu = min(pairs, experts)
+    return (2 * pairs * d * 2 + pairs * width * 2 + max(2 * gu[2] * width, dn[2] * d) * zp * 4 + pairs * d * 4
+            + maxu * 4 + 4 + maxu * rows * 4 + (maxu + pairs // PROMPT_PASS + 1) * 2 * 4 + 4)
 
 
 def mla_geometry(t: dict, world: int, reserve: int, *, minimum_slots: int = 2560, latent: bool = False,
-                 mtp: bool | None = None) -> Geometry:
-    """GLM's engine; ``mtp``: whether it holds the MTP head's caches and buffers (None: when the checkpoint has one)."""
+                 mtp: bool | None = None, decode_rows: int | None = None, kv: str = "bf16",
+                 ring: bool = False, onepass: bool = False) -> Geometry:
+    """GLM's engine; ``mtp``: whether it holds the MTP head's caches and buffers (None: when the checkpoint has one);
+    ``decode_rows``: the decode windows' rows the buffers are sized for (default MLA_DECODE_ROWS, 64; GLM's
+    --parallel asks for more when its own verify window and the batched one take more together, Mia's 0069);
+    ``kv``: the DSA caches' format (TF_GLM_KV, ``mla_row_bytes``: the latent rows and the indexer's pooled keys; the
+    indexer's per-token keys and gates stay bf16); ``ring``: those keys and gates in a ring of ``mla_index_ring``
+    rows (TF_GLM_INDEX_RING, by default with fp8: forward.Caches) instead of full-length planes;
+    ``onepass``: prompt chunks' sparse latent attention keeps no partials (TF_GLM_SPARSE_ONEPASS, Mia's 0028)."""
+    if kv != "bf16" and not latent:
+        raise ValueError("TF_GLM_KV=fp8 needs the latent cache")
     linear, attention = layer_counts(t)
     lin = t.get("linear_attn_config") or {}
     heads = int(t["num_attention_heads"]) // world
@@ -263,7 +300,8 @@ def mla_geometry(t: dict, world: int, reserve: int, *, minimum_slots: int = 2560
     kd = int(t["qk_nope_head_dim"]) + int(t.get("qk_rope_head_dim", 0))
     vd, index = int(t["v_head_dim"]), int(t.get("index_head_dim", 128))
     mtp = int(t.get("num_nextn_predict_layers", 0)) > 0 if mtp is None else bool(mtp)
-    rows, d, streams = 64, int(t["hidden_size"]), int(t.get("hc_mult", 4))
+    rows = MLA_DECODE_ROWS if decode_rows is None else int(decode_rows)
+    d, streams = int(t["hidden_size"]), int(t.get("hc_mult", 4))
     fixed = linear * (4 * lh * ld * ld * 4 + 3 * (conv - 1) * 3 * lh * ld * 2)
     fixed += linear * rows * (3 * lh * ld + 2 * ld + lh) * 2
     fixed += linear * rows * lh * (12 * ld + 4)
@@ -275,34 +313,148 @@ def mla_geometry(t: dict, world: int, reserve: int, *, minimum_slots: int = 2560
     fixed += (2 if mtp else 1) * (16 * rows * extent * 4 + 8 * rows * 16384 * 4)
     # prompt-chunk buffers: at most 5 row extents a row without the head
     fixed += PREFILL_ROWS * 5 * (extent - int(t["vocab_size"]) // world)
-    if (t.get("_quantization") or {}).get("quant_method") == "exl3":
-        # EXL3 experts' scratch (decode windows, the MTP head's, a prompt chunk) and the prompt's BF16 split-K partials
-        fixed += (2 if mtp else 1) * exl3_expert_scratch(rows, slots, d, width)
-        fixed += exl3_expert_scratch(PREFILL_ROWS, slots, d, width) + 8 * PREFILL_ROWS * 16384 * 4
+    quant = t.get("_quantization") or {}
+    if quant.get("quant_method") == "exl3":
+        # the routed experts' scratch (exl3.experts.Scratch) of the decode windows (the MTP head's too) and of a
+        # prompt chunk, as forward.Buffers allocates them
+        from tensorfold.families.glm5_next.cuda.exl3_generic import DECODE_PROMPT_ROWS
+
+        experts = int(t["n_routed_experts"])
+        fixed += (2 if mtp else 1) * exl3_expert_scratch(rows, slots, d, width, experts, DECODE_PROMPT_ROWS)
+        fixed += exl3_expert_scratch(PREFILL_ROWS, slots, d, width, experts)
+        if mla_dense_exl3(t):
+            # EXL3 dense layers (RED-SNOW): the plain matrices' split-K partials, the prompt GEMM's workspace and the
+            # decode kernel's shared scratch, exactly as forward.Buffers / exl3_dense.SCRATCH allocate them
+            fixed += sum(mla_exl3_dense_scratch(t, world, mtp=mtp).values())
+        else:
+            # BF16 dense layers (Mia's TR3): the prompt's BF16 split-K partials (forward.Buffers' b.sk)
+            fixed += 8 * PREFILL_ROWS * 16384 * 4
     count = attention + int(mtp)
     lw = int(t.get("kv_lora_rank", 512))
     def bytes_at(capacity: int) -> int:
-        scratch = mla_chunk_scratch(t, world, capacity, latent=latent)
+        scratch = mla_chunk_scratch(t, world, capacity, latent=latent, onepass=onepass)
         if latent:
             # latent cache; a prompt chunk's partials (MLA_PROMPT_ATT_ROWS rows at a time) and absorbed rows (MTP's too)
-            cache = count * capacity * lw * 2
+            cache = count * capacity * mla_row_bytes(lw, kv)
             dense = min(capacity, minimum_slots) + PREFILL_ROWS
             scratch += (((dense + 511) // 512) * min(PREFILL_ROWS, MLA_PROMPT_ATT_ROWS) * heads * (lw + 2) * 4
                         + 4 * PREFILL_ROWS * heads * lw)
         else:
             cache = count * capacity * heads * (kd + vd) * 2
             scratch += (2 if mtp else 1) * ((capacity + rows + 511) // 512) * rows * heads * (kd + 2) * 4
-        cache += count * (2 * capacity + capacity // 4 + 2) * index * 2
+        # the indexer's pooled keys over the capacity; its per-token keys and gates full length, or in a ring
+        keys = mla_index_ring(capacity, PREFILL_ROWS) if ring else capacity
+        cache += count * (2 * keys * index * 2 + (capacity // 4 + 2) * mla_row_bytes(index, kv))
         return fixed + cache + scratch
     return Geometry(bytes_at, reserve, minimum_slots)
 
 
-def mla_chunk_scratch(t: dict, world: int, capacity: int, *, latent: bool) -> int:
-    """A prompt chunk's transient bytes: token selection (fp32 pool scores, chosen pools, token lists), then sparse attention's partials."""
+# GLM's EXL3 dense matrices (families/glm5_next/cuda/exl3_dense.py ROWS / GEMM_MAX) and BF16 matmul split
+# (qmm.b16_split_k: B16_BN, B16_BK, SPLIT_TARGET); tests check these copies against the originals
+EXL3_DENSE_ROWS = 128
+EXL3_GEMM_MAX = 96 * 2**20
+HADAMARD_BYTES = 128 * 128 * 2
+
+
+def b16_split_k(n: int, k: int, bn: int = 64, bk: int = 64, target: int = 192) -> int:
+    """GLM's BF16 matmul K slices for an [n, k] matrix (a copy of ``qmm.b16_split_k``)."""
+
+    tiles, steps, sk = -(-n // bn), k // bk, 1
+    while sk < 8 and tiles * sk < target and steps % (sk * 2) == 0 and steps // (sk * 2) >= 4:
+        sk *= 2
+    return sk
+
+
+def mla_dense_exl3(t: dict) -> bool:
+    """A GLM EXL3 checkpoint whose dense layers and head are EXL3 too: the mul1 codebook (RED-SNOW). Mia's mcg
+    checkpoint keeps BF16 dense layers. (config.json is all the geometry sees; the loader decides per tensor.)"""
+
+    quant = t.get("_quantization") or {}
+    return quant.get("quant_method") == "exl3" and str(quant.get("codebook") or "").lower() == "mul1"
+
+
+def mla_exl3_matrices(t: dict, world: int, *, mtp: bool) -> dict:
+    """One rank's dense matrices of an EXL3-dense GLM checkpoint as the loader builds them:
+    ``x3`` EXL3 (K, N), ``stacked`` plain parts written through a Stack (N, K), ``b16`` every plain matrix (N, K)."""
+
+    lin = t.get("linear_attn_config") or {}
+    d = int(t["hidden_size"])
+    lh = int(lin.get("num_heads", t.get("linear_num_heads", 64))) // world
+    ld = int(lin.get("head_dim", t.get("linear_head_dim", 128)))
+    hl = int(t["num_attention_heads"]) // world
+    qk = int(t["qk_nope_head_dim"]) + int(t.get("qk_rope_head_dim", 0))
+    vd, ql, kl = int(t["v_head_dim"]), int(t["q_lora_rank"]), int(t["kv_lora_rank"])
+    rope = int(t.get("qk_rope_head_dim", 0))
+    ih, idim = int(t.get("index_n_heads", 32)), int(t.get("index_head_dim", 128))
+    shared = int(t["moe_intermediate_size"]) * int(t.get("n_shared_experts", 1)) // world
+    x3 = {"qkv": (d, 3 * lh * ld), "kda_o": (lh * ld, d), "q_a": (d, ql), "kv_a": (d, kl + rope),
+          "q_b": (ql, hl * qk), "dsa_o": (hl * vd, d), "shared_gate": (d, shared), "shared_up": (d, shared),
+          "shared_down": (shared, d), "head": (d, int(t["vocab_size"]) // world)}
+    if int(t.get("first_k_dense_replace", 0)) > 0:
+        inter = int(t["intermediate_size"]) // world
+        x3.update(gate=(d, inter), up=(d, inter), down=(inter, d))
+    if mtp:
+        x3["eh"] = (2 * d, d)
+    stacked = {"kda_tail": (2 * ld + lh, d)}          # f_a | g_a | b beside qkv in the KDA projection's Stack
+    b16 = {**stacked, "f_b": (lh * ld, ld), "g_b": (lh * ld, ld), "kv_k": (hl * qk, kl), "kv_v": (hl * vd, kl),
+           "index_kw": (idim + ih, d), "index_qb": (ih * idim, ql)}
+    return {"x3": x3, "stacked": stacked, "b16": b16}
+
+
+def mla_exl3_dense_scratch(t: dict, world: int, *, mtp: bool, prompt_rows: int = PREFILL_ROWS) -> dict:
+    """Bytes of an EXL3-dense GLM rank's dense-matmul workspaces:
+    ``partials``: the prompt buffer's b.sk, fp32 prompt_rows x max(sk * n) over the plain (BF16) matrices;
+    ``prompt``: the prompt GEMM's fp16 decoded W_q (the largest K x N up to EXL3_GEMM_MAX; the head is bigger and takes
+    decode pieces) and rotated inputs (prompt_rows x its largest K), plus the Hadamard block;
+    ``decode``: exl3_dense.SCRATCH's decode buffers at 128 rows: fp16 xh, fp32 split-K z, bf16 and fp32 tmp.
+    (The decode windows' own b.sk stays under mla_geometry's 8 x rows x 16384 bound.)"""
+
+    from tensorfold.cuda.exl3.linear import plan
+
+    m = mla_exl3_matrices(t, world, mtp=mtp)
+    rows = EXL3_DENSE_ROWS
+    partials = max([b16_split_k(n, k) * n for n, k in m["b16"].values() if b16_split_k(n, k) > 1], default=0)
+    gemm = [(k, n) for k, n in m["x3"].values() if k * n <= EXL3_GEMM_MAX]
+    w = max([k * n for k, n in gemm], default=0)
+    prompt = 2 * (w + prompt_rows * max([k for k, _ in gemm], default=0)) + (HADAMARD_BYTES if gemm else 0)
+    xh = max([1] + [rows * k for k, _ in m["x3"].values()])
+    z = max([1] + [plan(k, n)[0] * rows * n for k, n in m["x3"].values() if plan(k, n)[0] > 1])
+    tmp = max([1] + [rows * n for _, n in m["x3"].values()] + [rows * n for n, _ in m["stacked"].values()])
+    return {"partials": 4 * max(1, prompt_rows * partials), "prompt": prompt, "decode": 2 * xh + 4 * z + 6 * tmp}
+
+
+def mla_index_ring(capacity: int, rows: int) -> int:
+    """Rows of GLM's indexer key and gate rings (forward.index_ring): the widest window and 3, rounded up to 64."""
+    return min(capacity, -(-(rows + 3) // 64) * 64)
+
+
+def mla_ring_bytes(t: dict, rows: int, *, mtp: bool = False) -> int:
+    """One stream slot's indexer key and gate rings on a rank (forward.Caches): every indexed layer (the DSA layers,
+    and the MTP layer with ``mtp``), 2 x ``mla_index_ring`` rows of the index width in bf16 (at most: a small
+    context's ring is the context)."""
+    _, attention = layer_counts(t)
+    count = attention + int(mtp)
+    return count * 2 * -(-(rows + 3) // 64) * 64 * int(t.get("index_head_dim", 128)) * 2
+
+
+def mla_row_bytes(width: int, kv: str = "bf16") -> int:
+    """A GLM DSA cache row of ``width`` values: bf16, or TF_GLM_KV=fp8's e4m3 codes, fp32 scale and 12 pad bytes
+    (families/glm5_next/cuda/kv8.py)."""
+    if kv not in ("bf16", "fp8"):
+        raise ValueError(f"a GLM DSA cache is bf16 or fp8, not {kv!r}")
+    return width + 16 if kv == "fp8" else 2 * width
+
+
+def mla_chunk_scratch(t: dict, world: int, capacity: int, *, latent: bool, onepass: bool = False) -> int:
+    """A prompt chunk's transient bytes: token selection (fp32 pool scores, chosen pools, token lists), then sparse
+    attention's partials, which the latent path's one-pass kernel (``onepass``: TF_GLM_SPARSE_ONEPASS) does not
+    allocate."""
 
     heads, topk = int(t["num_attention_heads"]) // world, int(t.get("index_topk", 2048))
     # the fp32 pool scores of at most MLA_SELECT_ROWS rows at once, the chosen pools and token lists of the chunk's
     select = min(PREFILL_ROWS, MLA_SELECT_ROWS) * 4 * ((capacity + 3) // 4) + PREFILL_ROWS * 16 * (topk + 3)
+    if latent and onepass:
+        return select
     if latent:
         return select + ((topk + 515) // 512) * PREFILL_ROWS * heads * (int(t.get("kv_lora_rank", 512)) + 2) * 4
     kd = int(t["qk_nope_head_dim"]) + int(t.get("qk_rope_head_dim", 0))

@@ -183,40 +183,38 @@ def _same(a: list, b: list) -> bool:
 
 
 def test_a_kept_prompt_point_resumes_the_rings_drafts_round_by_round(engine_ring):
-    """A prompt kept one token early (the engine's len - 1) in a ring wrapped past its window: an identical resend and
-    a next turn resumed from it draft, round by round, what a fresh prefill of the same prompt drafts."""
+    """A prompt's state kept at an interior point (as the engine keeps a shared-prefix point: prefill to it with
+    ``sample=False`` then ``take_snapshot``) in a ring wrapped past its window: a next turn resumed from it drafts,
+    round by round, what a fresh prefill of the turn drafts; the ring's window came along with the snapshot."""
 
     from tensorfold.families.glm5_next.cuda import decode
 
     e, drafter = engine_ring.e, engine_ring.drafter
     prompt = [int(t) for t in np.random.default_rng(41).integers(0, 1000, size=300)]      # 128 + 128 + 44 rows
-    kept = []
-    first = decode.prefill(e, prompt, None, drafter=drafter, keep_at=len(prompt) - 1, keep=kept.append)
-    fresh = _rounds(drafter, first, 1)
-    snap = kept[-1]
-    assert snap.drafter_end == len(prompt) - 1 and snap.drafter_rows is not None
-    again = decode.prefill(e, prompt, None, drafter=drafter, resume=snap, keep_at=len(prompt) - 1, keep=kept.append)
-    assert again == first and _same(_rounds(drafter, again, 1), fresh)                        # identical resend
-    turn = prompt[:-1] + [271, 77, 78]
-    first = decode.prefill(e, turn, None, drafter=drafter, resume=kept[-1], keep_at=len(turn) - 1, keep=kept.append)
+    point = len(prompt) - 1
+    decode.prefill(e, prompt[:point], None, drafter=drafter, sample=False)
+    snap = decode.take_snapshot(e, prompt[:point], e.last_hidden, mtp=True, drafter=drafter)
+    assert snap.drafter_end == point and snap.drafter_rows is not None
+    turn = prompt[:point] + [271, 77, 78]
+    first = decode.prefill(e, turn, None, drafter=drafter, resume=snap)
     resumed = _rounds(drafter, first, 2)
     assert decode.prefill(e, turn, None, drafter=drafter) == first                             # next turn, fresh
     assert _same(_rounds(drafter, first, 2), resumed)
 
 
-def test_a_kept_point_its_chunk_wrote_past_keeps_no_ring_window(engine_ring):
-    """Past the ring's slack behind the chunk's end the kept point's window is gone: DFlash2 won't resume from it."""
+def test_a_kept_interior_point_always_keeps_the_rings_window(engine_ring):
+    """With the sample=False keep flow a prompt stops exactly at the kept point, so the ring still holds its window
+    at any point (the removed mid-chunk cut could write past it and lose the window)."""
 
     from tensorfold.families.glm5_next.cuda import decode
 
     e, drafter = engine_ring.e, engine_ring.drafter
-    rows, slack = e.prefill_rows, drafter.ring - drafter.window
-    prompt = [int(t) for t in np.random.default_rng(43).integers(0, 1000, size=rows)]
-    kept = []
-    decode.prefill(e, prompt, None, drafter=drafter, keep_at=rows - slack, keep=kept.append)
-    assert kept[-1].drafter_end == -1 and kept[-1].drafter_rows is None
-    decode.prefill(e, prompt, None, drafter=drafter, keep_at=rows - slack + 1, keep=kept.append)
-    assert kept[-1].drafter_end == rows - slack + 1 and kept[-1].drafter_rows is not None
+    rows = e.prefill_rows
+    prompt = [int(t) for t in np.random.default_rng(43).integers(0, 1000, size=rows + 30)]
+    for point in (rows - 5, rows, rows + 20):
+        decode.prefill(e, prompt[:point], None, drafter=drafter, sample=False)
+        snap = decode.take_snapshot(e, prompt[:point], e.last_hidden, mtp=True, drafter=drafter)
+        assert snap.drafter_end == point and snap.drafter_rows is not None, point
 
 
 def test_identical_resends_and_a_turn_keep_the_rings_window_through_the_engine(engine_ring):
@@ -230,11 +228,122 @@ def test_identical_resends_and_a_turn_keep_the_rings_window_through_the_engine(e
     want = (fresh, stats["rounds"], stats["min_rows"])
     for _ in range(3):
         again, stats = _generate(engine_ring, prompt, None, policy="fc5:0.3", tokens=24)
-        assert stats["cached"] == len(prompt) - 1 and (again, stats["rounds"], stats["min_rows"]) == want
+        assert stats["cached"] == len(prompt) and (again, stats["rounds"], stats["min_rows"]) == want  # a replay
     turn = prompt[:-1] + [271, 77, 78]
     resumed, stats = _generate(engine_ring, turn, None, policy="fc5:0.3", tokens=24)
-    assert stats["cached"] == len(prompt) - 1
+    assert stats["cached"] == 0                           # a different ending shares no kept state (no shared prefix)
     got = (resumed, stats["rounds"], stats["min_rows"])
     _forget(engine_ring)
     fresh, stats = _generate(engine_ring, turn, None, policy="fc5:0.3", tokens=24)
     assert stats["cached"] == 0 and (fresh, stats["rounds"], stats["min_rows"]) == got
+
+
+@pytest.fixture(scope="module", params=[1, 2], ids=["one_rank", "rank0_of_two"])
+def drafters(request, tmp_path_factory):
+    """A flat and a ring drafter (window 48: the ring wraps every 128 rows), on one rank or as rank 0 of two (every
+    all-gather returns this rank's rows twice)."""
+
+    from tensorfold.families.glm5_next.cuda.dflash2 import Drafter
+    from test_glm_engine import _TwoCopies
+
+    path = tmp_path_factory.mktemp(f"mdraft{request.param}")
+    _drafter(path)
+    (path / "config.json").write_text(json.dumps(dict(DRAFT, sliding_window=49)))
+    w = _weights()
+    if request.param == 2:
+        w.world, w.comm = 2, _TwoCopies()
+    pair = [Drafter(path, w, capacity=4000, ring=ring, tap_rows=16) for ring in (False, True)]
+    assert pair[0].ring == 0 and pair[1].ring == 128 and pair[0].gathered == request.param
+    yield pair
+    del pair
+    torch.cuda.empty_cache()
+
+
+@pytest.mark.parametrize("graphs", [False, True], ids=["eager", "graphs"])
+@pytest.mark.parametrize("ring", [False, True], ids=["flat", "ring"])
+def test_batched_drafts_equal_each_streams_own(drafters, ring, graphs):
+    """TF_GLM_MULTI_DRAFT=batched against serial: three streams' ``MultiDrafter`` slots and three solo contexts fed
+    the same taps (prompt chunks alone, a round's kept rows together) propose the same chains and candidates, bit
+    for bit, in block passes of 1, 2 and 3 streams in any order: mixed policies (keyed samples, confidence and
+    noise-aware stops), a stream with no context yet, a stream that copied (keeps rows, asks nothing), a kept
+    window taken and put back over another conversation's rows."""
+
+    from tensorfold.engine.exact_sampling import Sampling
+    from tensorfold.families.glm5_next.cuda.dflash2_multi import (DraftRequest, MultiDrafter, context, put_window,
+                                                                  take_window)
+
+    d = drafters[int(ring)]
+    refs = [context(d, capture=graphs) for _ in range(3)]
+    md = MultiDrafter(d, 3)
+    if graphs:
+        md.capture()
+        assert sorted(md.block_graphs) == [1, 2, 3] and md.tap_graphs
+    ctxs = md.contexts
+    rng = np.random.default_rng(int(ring) * 2 + int(graphs))
+    gen = torch.Generator(device="cuda").manual_seed(7)
+    width = d.tap_in.shape[1]
+    policies = [dict(sampling=Sampling(1234, 1.0, 20, 0.95), confidence=0.0),
+                dict(sampling=None, confidence=0.3),
+                dict(sampling=Sampling(77, 0.8, 0, 0.9), confidence=0.3, beta=2.0),
+                dict(sampling=None, confidence=0.0, beta=2.0, round_ms=(55.0, 57.0, 58.5, 60.0, 61.0, 62.5, 64.0, 66.0))]
+
+    def taps(n: int) -> torch.Tensor:
+        return (torch.randn((n, width), generator=gen, device="cuda") * 0.5).bfloat16()
+
+    def alone(s: int, n: int) -> None:                   # a prompt chunk of stream s
+        t = taps(n)
+        refs[s].add_taps(t)
+        ctxs[s].add_taps(t)
+
+    def ends() -> list[int]:
+        got = [c.context_end for c in ctxs]
+        assert got == [c.context_end for c in refs] == md.pos[:3].tolist()
+        return got
+
+    alone(0, 300)
+    alone(1, 77)
+    asking = [[0], [0, 1, 2], [2, 0], [1], [0, 2]]       # stream 1 copies in the last pattern: it keeps, asks nothing
+    drafted = sizes = 0
+    for r in range(30):
+        who = asking[r % 5]
+        reqs = []
+        for s in who:
+            p = policies[(s + r) % 4]
+            reqs.append(DraftRequest(ctxs[s], int(rng.integers(0, 1000)), int(rng.integers(1, d.block + 2)), **p))
+        got = md.propose(reqs)
+        want = [refs[s].propose(q.pending, q.depth, q.sampling, q.confidence, beta=q.beta, round_ms=q.round_ms)
+                for s, q in zip(who, reqs)]
+        assert got == want, (r, who)
+        drafted += sum(len(g) for g in got)
+        live = [(s, q) for s, q in zip(who, reqs) if refs[s].context_end > 0]
+        if live:
+            cand = md.candidates([(ctxs[s], q.pending, min(q.depth, d.block - 1)) for s, q in live])
+            sizes = max(sizes, len(live))
+            for (s, q), c in zip(live, cand):
+                assert all(np.array_equal(x, y)
+                           for x, y in zip(c, refs[s].candidates(q.pending, min(q.depth, d.block - 1)))), (r, s)
+        keep = [int(rng.integers(1, d.block + 1)) for _ in range(3)]
+        if r % 5 == 4:
+            keep[1] = 16                                # copy drafts: a 16-row window kept whole
+        items = []
+        for s in range(3):
+            if refs[s].context_end == 0 and r < 10:
+                continue                                # no prompt yet
+            t = taps(keep[s])
+            refs[s].add_taps(t)
+            items.append((ctxs[s], t))
+        md.commit(items)
+        ends()
+        if r == 10:
+            alone(2, 200)                               # stream 2's prompt arrives
+        if r == 20:                                     # stream 1's state kept, another conversation, put back
+            n = ends()[1]
+            rows = take_window(refs[1], n)
+            assert all(torch.equal(a, b) for a, b in zip(rows, take_window(ctxs[1], n)))
+            for c in (refs[1], ctxs[1]):
+                c.reset()
+            alone(1, 333)
+            for c in (refs[1], ctxs[1]):
+                put_window(c, n, rows)
+            ends()
+    assert drafted > 0 and sizes == 3

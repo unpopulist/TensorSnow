@@ -61,7 +61,12 @@ def effort_levels(template: str | None) -> frozenset[str]:
 
 
 def coerce_effort(effort: str | None, levels: frozenset[str] = frozenset()) -> str | None:
-    """The nearest level the template names, ties going higher. None stays None, and xhigh stays xhigh."""
+    """The nearest level the template names, ties going higher. None stays None, and xhigh stays xhigh.
+
+    A template that names ``max`` (GLM-5.3: ``low``, ``high``, ``max``) maps anything but its other named
+    levels to ``max`` in its own Jinja (``reasoning_effort if ... in ['low', 'high'] else 'max'``), so the
+    effort is passed through unchanged and the template does the mapping: ``medium`` and ``minimal`` render as
+    ``Max``, not rounded to the nearest lower name. This matches the other GLM-5.3 server on this box."""
 
     if effort is None:
         return None
@@ -70,6 +75,8 @@ def coerce_effort(effort: str | None, levels: frozenset[str] = frozenset()) -> s
             return "xhigh"
         if effort == "minimal":
             return "low"
+        return effort
+    if "max" in levels:
         return effort
     if effort in levels or effort in ("xhigh", "none"):
         return effort

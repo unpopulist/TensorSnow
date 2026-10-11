@@ -3,7 +3,7 @@ class RequestError(ValueError):
 
 
 class CapacityError(RequestError):
-    """A transient capacity refusal: HTTP 503, retry shortly."""
+    """A transient capacity refusal: HTTP 429 + Retry-After (see admission_response)."""
 
 
 class RoundError(RuntimeError):
@@ -21,6 +21,15 @@ class ContextLengthError(RequestError):
 
 
 CONTEXT_LIMIT = "This server's maximum context length is"      # OpenAI's wording, which clients match to compact
+
+
+def admission_response(exc: Exception) -> tuple[int, dict[str, str] | None]:
+    """(status, headers) of a refusal on every API route: a capacity refusal is 429 with ``Retry-After`` (not a bare
+    503), so the same client backs off instead of retrying at once; anything else is 400. A deliberate difference
+    from vLLM, whose 503 lets a load balancer route to another instance: one server has no other to route to
+    (Mia's 0081)."""
+
+    return (429, {"Retry-After": "5"}) if isinstance(exc, CapacityError) else (400, None)
 
 
 def refusal(problem: str) -> RequestError:

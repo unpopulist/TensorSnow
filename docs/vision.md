@@ -117,7 +117,7 @@ tensorfold serve Vontra/Qwen3.8-Flash-Next-MLX-4bit-MTP --parallel 2 --vision \
 Changing the count does not change the other limits: 10 MiB encoded per image and 20 MiB total, within a 32 MiB HTTP body.
 Decoded images are bounded to 8,192 pixels per dimension, 16 million pixels per image and 32 million total.
 EXIF orientation is applied and transparency is composited onto white; animated and multipage inputs are refused.
-Up to 16 requests decode and process images at once; more wait up to a minute, and past 128 waiting the server answers 503 so the client retries.
+Up to 16 requests decode and process images at once; more wait up to a minute, and past 128 waiting the server answers 429 with Retry-After so the client retries.
 The request log (`TENSORFOLD_REQUEST_LOG`) records image parts as `<redacted>`.
 The model processor bounds the total expanded image tokens to 4,096, with a smaller budget for `detail: low`.
 That budget is shared across the images; a higher count can reduce the detail available for each image.

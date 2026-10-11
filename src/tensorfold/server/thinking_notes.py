@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 from typing import Any
 
@@ -12,7 +13,8 @@ OFF = 'chat_template_kwargs {"enable_thinking": false}'
 def template_thinks(model_dir: Path) -> bool:
     """Whether the checkpoint's chat template reads ``enable_thinking`` (its default decides a silent request)."""
 
-    template = Path(model_dir) / "chat_template.jinja"
+    override = os.environ.get("TF_GLM_CHAT_TEMPLATE")      # --chat-template: the alternate template decides
+    template = Path(override) if override else Path(model_dir) / "chat_template.jinja"
     if template.is_file() and "enable_thinking" in template.read_text(errors="ignore"):
         return True
     config = Path(model_dir) / "tokenizer_config.json"

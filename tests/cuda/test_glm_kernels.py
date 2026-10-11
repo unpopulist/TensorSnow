@@ -87,6 +87,99 @@ def test_moe_kernels_rows_invariant():
 
 
 @cuda
+@pytest.mark.parametrize("wdt", [torch.float32, torch.bfloat16])
+def test_hc_pre_row_pieces_same_bits(monkeypatch, wdt):
+    """TF_GLM_HC_PRE_ROWS: a prompt chunk's hc_pre in 256-row pieces gives the unpieced bits, every row the bits it
+    has alone; decode rows (prompt=False) take the unchanged path. fp32 mixing weights (RED-SNOW) and bf16 (Mia)."""
+    from tensorfold.families.glm5_next.cuda import glue
+
+    gen = torch.Generator().manual_seed(3)
+    R, S, D = 600, 4, 4096
+    x = (torch.randn((R, S * D), generator=gen) * (0.2 + 2 * torch.rand((1, S * D), generator=gen))).to(
+        torch.bfloat16).cuda()
+    fn = (torch.randn((24, S * D), generator=gen) * 0.01).to(wdt).cuda()
+    base = (torch.randn((24,), generator=gen) * 0.1).cuda()
+    scale = torch.tensor([0.5, 0.7, 1.1]).cuda()
+    nw = (1 + 0.1 * torch.randn((D,), generator=gen)).to(torch.bfloat16).cuda()
+
+    def run(xx, prompt=True):
+        n = xx.shape[0]
+        bufs = (torch.empty((n, D), dtype=torch.bfloat16, device="cuda"), torch.empty((n, D // 64), device="cuda"),
+                torch.empty((n, S), device="cuda"), torch.empty((n, S * S), device="cuda"))
+        part = torch.empty((n, glue.HC_BLOCKS, 32), device="cuda")
+        glue.hc_pre(xx, fn, base, scale, nw, *bufs, part, 1e-5, 1e-6, 20, prompt=prompt)
+        return bufs
+
+    monkeypatch.setattr(glue, "HC_PRE_ROWS", 0)
+    whole = run(x)
+    dec = [run(x[:n], prompt=False) for n in (1, 16)]
+    monkeypatch.setattr(glue, "HC_PRE_ROWS", 256)
+    for a, b in zip(run(x), whole):
+        assert torch.equal(a, b)
+    for n, ref in zip((1, 16), dec):
+        assert all(torch.equal(a, b) for a, b in zip(run(x[:n], prompt=False), ref))
+    for r in (0, 255, 256, 511, 512, 599):
+        alone = run(x[r:r + 1].contiguous())
+        assert all(torch.equal(a[0], b[r]) for a, b in zip(alone, whole))
+
+
+@cuda
+@pytest.mark.parametrize("wdt", [torch.float32, torch.bfloat16])
+def test_hc_chain_same_bits(monkeypatch, wdt):
+    """TF_GLM_HC_CHAIN: a prompt chunk's hc_post and the next hc_pre run together on 256-row pieces (two ranks'
+    partials: ``hc_post_rows``, the row split's ``hc_post_pair``) give today's separate whole calls' bits, and a row
+    alone the bits it has inside the 600-row chunk. fp32 mixing weights (RED-SNOW) and bf16 (Mia)."""
+    from tensorfold.families.glm5_next.cuda import glue
+
+    gen = torch.Generator().manual_seed(5)
+    R, S, D = 600, 4, 4096
+    x0 = (torch.randn((R, S * D), generator=gen) * (0.2 + 2 * torch.rand((1, S * D), generator=gen))).to(
+        torch.bfloat16).cuda()
+    g = (torch.randn((2, R, D), generator=gen) * 0.5).cuda()
+    fn = (torch.randn((24, S * D), generator=gen) * 0.01).to(wdt).cuda()
+    base = (torch.randn((24,), generator=gen) * 0.1).cuda()
+    scale = torch.tensor([0.5, 0.7, 1.1]).cuda()
+    nw = (1 + 0.1 * torch.randn((D,), generator=gen)).to(torch.bfloat16).cuda()
+    post0 = torch.rand((R, S), generator=gen).cuda() * 2
+    comb0 = torch.rand((R, S * S), generator=gen).cuda() / S
+
+    def run(lo, hi, how):
+        """hc_post then hc_pre of rows lo .. hi: ``whole`` (today's calls), ``chain`` or ``pair`` (row split)."""
+        n = hi - lo
+        x, post, comb = x0[lo:hi].clone(), post0[lo:hi].clone(), comb0[lo:hi].clone()
+        gg = g[:, lo:hi].contiguous()
+        out = (torch.empty((n, D), dtype=torch.bfloat16, device="cuda"), torch.empty((n, D // 64), device="cuda"))
+        part = torch.empty((n, glue.HC_BLOCKS, 32), device="cuda")
+
+        def pre(a, z):
+            glue.hc_pre(x[a:z], fn, base, scale, nw, out[0][a:z], out[1][a:z], post[a:z], comb[a:z], part[a:z],
+                        1e-5, 1e-6, 20, prompt=True)
+
+        if how == "whole":
+            glue.hc_post(x, x, gg, post, comb)
+            pre(0, n)
+        elif how == "chain":
+            glue.hc_chain(0, n, lambda a, z: glue.hc_post_rows(x, gg, post, comb, a, z), pre, prompt=True)
+        else:
+            g0, g1 = gg[0].clone(), gg[1].clone()
+            glue.hc_chain(0, n, lambda a, z: glue.hc_post_pair(x[a:z], x[a:z], g0[a:z], g1[a:z], post[a:z],
+                                                               comb[a:z]), pre, prompt=True)
+        return (x, *out, post, comb)
+
+    monkeypatch.setattr(glue, "HC_CHAIN", False)
+    monkeypatch.setattr(glue, "HC_PRE_ROWS", 0)
+    whole = run(0, R, "whole")                       # hc_post, then hc_pre, each over every row at once
+    monkeypatch.setattr(glue, "HC_PRE_ROWS", 256)
+    assert all(torch.equal(a, b) for a, b in zip(run(0, R, "whole"), whole))   # today's calls (pieced hc_pre)
+    monkeypatch.setattr(glue, "HC_CHAIN", True)
+    for how in ("chain", "pair"):
+        assert all(torch.equal(a, b) for a, b in zip(run(0, R, how), whole)), how
+    for r in (0, 255, 256, 599):
+        alone = run(r, r + 1, "chain")
+        assert all(torch.equal(a[0], b[r]) for a, b in zip(alone, whole)), r
+
+
+@cuda
 def test_hc_pre_post_against_fp32():
     from tensorfold.families.glm5_next.cuda import glue
 

@@ -17,7 +17,8 @@ BACKEND_ENV = "TF_COMM_BACKEND"
 
 
 class Comm(Protocol):
-    """What every engine assumes; ``all_gather_fast``, ``exchange``, ``check`` (and NCCL's ``store``) are optional."""
+    """What every engine assumes; ``all_gather_fast``, ``exchange``, ``check``, ``settle`` (and NCCL's ``store``) are
+    optional."""
 
     rank: int
     world: int
@@ -165,6 +166,16 @@ def check(comm: Comm) -> None:
         found()
 
 
+def settle(comm: Comm) -> None:
+    """Tell the communicator's transport that startup is over on this rank (call it at the same point of the
+    collective sequence on every rank); a no-op for plain NCCL. RoCE gathers stop meeting the peer in an NCCL barrier
+    first."""
+
+    found = getattr(comm, "settle", None)
+    if found is not None:
+        found()
+
+
 def exchange(comm: Comm, sends: list[torch.Tensor], recvs: list[torch.Tensor], peer: int | None = None) -> None:
     """``comm.exchange`` when it has one, else (two ranks) each pair traded as bytes through the all-gather."""
 
@@ -210,6 +221,17 @@ def register_backend(name: str, wrap: Callable[[Comm], Comm]) -> None:
     """A transport over NCCL (still the control channel): ``wrap(nccl)`` runs on every rank at once."""
 
     BACKENDS[name] = wrap
+
+
+def _roce(base: Comm) -> Comm:
+    """TF_COMM_BACKEND=roce: small all-gathers over b12x's one-shot RoCE transport (``tensorfold.cuda.roce``)."""
+
+    from tensorfold.cuda.roce import RoceComm
+
+    return RoceComm(base)
+
+
+register_backend("roce", _roce)
 
 
 def open_comm(rank: int, world: int, master: str, port: int, *, backend: str | None = None, **nccl) -> Comm:

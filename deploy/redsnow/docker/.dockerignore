@@ -1,0 +1,5 @@
+# the main build context is this folder; the image needs only these two files from it (the tree comes from the
+# named context "tree", a git archive made by build.sh)
+*
+!prebuild.py
+!healthcheck.py

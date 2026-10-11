@@ -11,7 +11,7 @@ from tensorfold.cuda import health
 from tensorfold.server import anthropic, metrics, responses, token_routes
 from tensorfold.server.cancellation import RequestCancelled, socket_cancellation
 from tensorfold.server.decisions import DecisionError
-from tensorfold.server.errors import CapacityError, RequestError, error_body
+from tensorfold.server.errors import RequestError, admission_response, error_body
 from tensorfold.server.http import Server, wants_usage_chunk
 from tensorfold.server.request_body import read_body
 from tensorfold.server.stacks import Rearming
@@ -53,10 +53,12 @@ def make_handler(app: App):
             if not (self.command == "GET" and self.path.split("?", 1)[0].rstrip("/") in POLLED and code == 200):
                 super().log_request(code, size)
 
-        def _json(self, code: int, payload: dict[str, Any]) -> None:
+        def _json(self, code: int, payload: dict[str, Any], headers: dict[str, str] | None = None) -> None:
             data = json.dumps(payload).encode()
             try:
                 self.send_response(code)
+                for name, value in (headers or {}).items():     # a capacity refusal's Retry-After
+                    self.send_header(name, value)
                 self.send_header("Content-Type", "application/json")
                 self.send_header("Content-Length", str(len(data)))
                 if self.close_connection:                # so a pooling client does not reuse the socket
@@ -125,7 +127,8 @@ def make_handler(app: App):
                 try:
                     reply = app.detokenize(body) if path.endswith("/detokenize") else app.tokenize(body)
                 except RequestError as exc:
-                    return self._json(503 if isinstance(exc, CapacityError) else 400, {"error": error_body(exc)})
+                    code, headers = admission_response(exc)
+                    return self._json(code, {"error": error_body(exc)}, headers=headers)
                 except Exception as exc:
                     _log_error(exc)
                     return self._json(400, {"error": {"message": _error_message(exc)}})
@@ -134,8 +137,8 @@ def make_handler(app: App):
             try:
                 prepared = app.prepare(body, chat)
             except RequestError as exc:
-                return self._json(503 if isinstance(exc, CapacityError) else 400,
-                                  {"error": error_body(exc, field)})
+                code, headers = admission_response(exc)      # 429 + Retry-After for a capacity refusal
+                return self._json(code, {"error": error_body(exc, field)}, headers=headers)
             except Exception as exc:        # any other failure to read the request is refused too, as on MLX
                 _log_error(exc)
                 return self._json(400, {"error": {"message": _error_message(exc)}})
@@ -156,6 +159,11 @@ def make_handler(app: App):
                         "choices": [{"index": 0, "text": delta.get("content", ""), "finish_reason": finish}]}
 
             if stream:
+                try:
+                    app.admit(body, chat, prepared)      # a full server answers 429 here, not 200 and an error event
+                except RequestError as exc:
+                    code, _hd = admission_response(exc)
+                    return self._json(code, {"error": error_body(exc, field)}, headers=_hd)
                 self.send_response(200)
                 self.send_header("Content-Type", "text/event-stream")
                 self.send_header("Cache-Control", "no-cache")
@@ -184,6 +192,8 @@ def make_handler(app: App):
                     return self._stream_error({"message": _error_message(exc), "type": "server_error"})
                 if result["final"]:
                     emit(result["final"])
+                for delta in result.get("call_deltas") or ():      # the end of calls streamed as they were written
+                    emit(delta)
                 if result["calls"]:
                     for i, call in enumerate(result["calls"]):
                         if i < result.get("calls_streamed", 0):      # sent as deltas already
@@ -215,8 +225,8 @@ def make_handler(app: App):
                 self.close_connection = True
                 return
             except RequestError as exc:
-                return self._json(503 if isinstance(exc, CapacityError) else 400,
-                                  {"error": error_body(exc, field)})
+                code, headers = admission_response(exc)      # 429 + Retry-After for a capacity refusal
+                return self._json(code, {"error": error_body(exc, field)}, headers=headers)
             except Exception as exc:
                 _log_error(exc)
                 try:
@@ -290,6 +300,11 @@ def serve(app: App, host: str, port: int) -> None:
         with auth.signals() if auth is not None else nullcontext():
             server.serve_forever()
     except KeyboardInterrupt:
-        pass
+        hook = getattr(app, "on_exit", None)      # e.g. the spill tier's shutdown flush (cli._flush_on_exit)
+        if hook is not None:
+            try:
+                hook()
+            except Exception as exc:              # noqa: BLE001  (a shutdown never fails on a hook)
+                print(f"[tensorfold] shutdown hook failed: {exc!r}", flush=True)
     finally:
         server.server_close()

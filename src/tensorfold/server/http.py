@@ -15,7 +15,7 @@ from tensorfold.server import anthropic, live, responses, token_routes
 from tensorfold.server.tools import (active_tool_specs, parse_tool_calls_from_content, stream_tool_call_deltas,
                                      tool_choice_requires_call)
 from tensorfold.server.decisions import DecisionError
-from tensorfold.server.errors import CapacityError, RequestError, error_body
+from tensorfold.server.errors import CapacityError, RequestError, admission_response, error_body
 from tensorfold.server.request_options import parse_numbers, thinking_fields
 from tensorfold.server.probabilities import probability_options
 from tensorfold.server.messages import normalize_messages, validate_modalities
@@ -96,9 +96,12 @@ def make_handler(app: Any) -> type[BaseHTTPRequestHandler]:
         def log_message(self, format: str, *args: Any) -> None:
             print(f"[tensorfold] {self.address_string()} {format % args}")
 
-        def _send_json(self, payload: dict[str, Any], status: int = 200) -> None:
+        def _send_json(self, payload: dict[str, Any], status: int = 200,
+                       headers: dict[str, str] | None = None) -> None:
             body = json.dumps(payload).encode("utf-8")
             self.send_response(status)
+            for name, value in (headers or {}).items():     # a capacity refusal's Retry-After (admission_response)
+                self.send_header(name, value)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(body)))
             if self.close_connection:                    # so a pooling client does not reuse the socket
@@ -251,8 +254,8 @@ def make_handler(app: Any) -> type[BaseHTTPRequestHandler]:
                 separate_usage = wants_usage_chunk(body)      # usage then rides its own chunk before [DONE]
                 tool_policy = ToolCallPolicy(body)
             except RequestError as exc:
-                self._send_json({"error": error_body(exc, field)},
-                                status=503 if isinstance(exc, CapacityError) else 400)
+                status, headers = admission_response(exc)      # 429 + Retry-After for a capacity refusal
+                self._send_json({"error": error_body(exc, field)}, status=status, headers=headers)
                 return
             except Exception as exc:
                 self._send_json({"error": {"message": str(exc)}}, status=400)
@@ -507,6 +510,9 @@ def make_handler(app: Any) -> type[BaseHTTPRequestHandler]:
                 )
             except (BrokenPipeError, ConnectionResetError, RequestCancelled):
                 pass
+            except CapacityError as exc:        # before RequestError, which it is: 429 + Retry-After
+                status, headers = admission_response(exc)
+                self._send_json({"error": error_body(exc, field)}, status=status, headers=headers)
             except RequestError as exc:
                 self._send_json({"error": error_body(exc, field)}, status=400)
             except Exception as exc:  # surface runner errors to the client
@@ -523,7 +529,8 @@ def make_handler(app: Any) -> type[BaseHTTPRequestHandler]:
                 body = json.loads(read_body(self) or b"{}")
                 reply = token_routes.detokenize(app, body) if detokenize else token_routes.tokenize(app, body)
             except RequestError as exc:
-                self._send_json({"error": error_body(exc)}, status=503 if isinstance(exc, CapacityError) else 400)
+                status, headers = admission_response(exc)
+                self._send_json({"error": error_body(exc)}, status=status, headers=headers)
                 return
             except Exception as exc:  # noqa: BLE001 - a body the tokenizer cannot read is a client error
                 self._send_json({"error": {"message": str(exc), "type": "invalid_request_error"}}, status=400)

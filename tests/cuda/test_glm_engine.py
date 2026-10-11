@@ -38,10 +38,11 @@ CONFIG = {
 }
 
 
-def _checkpoint(path, exl3: bool = False, mtp: bool = True) -> None:
+def _checkpoint(path, exl3: bool = False, mtp: bool = True, hc_f32: bool = False) -> None:
     """The synthetic model as an MLX 4-bit checkpoint, or with ``exl3`` as an EXL3 one: routed experts as trellis
     tiles with their scales, every other weight BF16 (the layout of Mia-AiLab/GLM-5.3-Flash-EXL3-TR3-4bpw).
-    ``mtp=False`` leaves out the MTP layer (the last tensors written, so the others keep their values)."""
+    ``mtp=False`` leaves out the MTP layer (the last tensors written, so the others keep their values).
+    ``hc_f32``: the hyper-connection mixing weights in fp32 as RED-SNOW stores them (full fp32 values here)."""
 
     rng = np.random.default_rng(3)
     tensors: list[tuple[str, str, list[int], np.ndarray]] = []
@@ -109,7 +110,7 @@ def _checkpoint(path, exl3: bool = False, mtp: bool = True) -> None:
         bf16(p + "input_layernorm.weight", [D], 0.05, 1.0)
         bf16(p + "post_attention_layernorm.weight", [D], 0.05, 1.0)
         for site in ("attn", "ffn"):
-            bf16(p + f"hc_{site}_fn", [24, S * D], 0.01)
+            (f32 if hc_f32 else bf16)(p + f"hc_{site}_fn", [24, S * D], 0.01)
             f32(p + f"hc_{site}_base", [24])
             f32(p + f"hc_{site}_scale", [3], 0.1, 1.0)
     p = L + "layers.0.self_attn."
@@ -246,6 +247,20 @@ def engine_x(tmp_path_factory):
     return GlmEngine(path / "model", rank=0, master="", port=0, drafter=path / "dflash2", comm=_TwoCopies())
 
 
+@pytest.fixture(scope="module")
+def engine_h(tmp_path_factory):
+    """The model with fp32 mixing weights (RED-SNOW's hc_*_fn dtype): prompt rows' dots in _hc_partial_mma's
+    three-term split, decode rows' in _hc_partial."""
+
+    from tensorfold.families.glm5_next.cuda.engine import GlmEngine
+
+    path = tmp_path_factory.mktemp("glm_h")
+    _checkpoint(path, hc_f32=True)
+    e = GlmEngine(path, rank=0, master="", port=0, comm=_TwoCopies())
+    assert e.w.layers[0].attn_hc.fn.dtype == torch.float32
+    return e
+
+
 def _forget(engine) -> None:
     """Drop every kept snapshot, so the next request prefills from scratch (the engine keeps several
     conversations, so an unrelated prompt no longer does this)."""
@@ -345,7 +360,7 @@ def test_drafter_choice_resumes(engine_f):
     after = first + reply + [21, 22]
     for policy in ("auto:1:1:0", "auto", "2", "f3"):
         warm, stats = _generate(engine_f, after, sampling, policy=policy)
-        assert stats["cached"] == len(first) - 1, policy
+        assert stats["cached"] == len(first), policy          # resumes from the prompt's own end state (Mia's 0008)
         _forget(engine_f)
         cold, stats = _generate(engine_f, after, sampling, policy=policy)
         assert stats["cached"] == 0 and warm == cold, policy
@@ -360,19 +375,37 @@ def test_resumed_prompts_equal_fresh_prefills(engine, sampling):
     reply, _ = _generate(engine, first, sampling)
     after_reply = first + reply + [5, 6, 7]
     warm, stats = _generate(engine, after_reply, sampling)
-    assert stats["cached"] == len(first) - 1                # the reply prefills again
+    assert stats["cached"] == len(first)                # the reply prefills again
     _forget(engine)                                     # every kept state goes: the next prefill is fresh
     cold, stats = _generate(engine, after_reply, sampling)
     assert stats["cached"] == 0 and warm == cold
     _generate(engine, first, sampling)
     after_prompt = first + [11, 12, 13]
     warm, stats = _generate(engine, after_prompt, sampling, policy="2")
-    assert stats["cached"] == len(first) - 1
+    assert stats["cached"] == len(first)
     _forget(engine)
     cold, stats = _generate(engine, after_prompt, sampling, policy="2")
     assert stats["cached"] == 0 and warm == cold
     serial, _ = _generate(engine, after_prompt, sampling, draft=False)
     assert serial == cold
+
+
+def test_fp32_mixing_weights_drafted_equals_serial_and_resumes(engine_h):
+    """fp32 hc mixing weights: drafted replies equal serial ones, and a resumed prompt equals a fresh prefill."""
+
+    sampling = Sampling(77, 1.0, 20, 0.95)
+    rng = np.random.default_rng(78)
+    first = list(rng.integers(0, 1000, size=70))
+    serial, _ = _generate(engine_h, first, sampling, draft=False)
+    for policy in (None, "2", "c3:0.35"):
+        drafted, _ = _generate(engine_h, first, sampling, policy=policy)
+        assert drafted == serial, policy
+    after = first + serial + [5, 6, 7]
+    warm, stats = _generate(engine_h, after, sampling)
+    assert stats["cached"] == len(first)
+    _forget(engine_h)
+    cold, stats = _generate(engine_h, after, sampling)
+    assert stats["cached"] == 0 and warm == cold
 
 
 @pytest.mark.parametrize("sampling", [Sampling(4321, 1.0, 20, 0.95), None], ids=["sampled", "greedy"])
@@ -420,7 +453,7 @@ def test_decision_between_chats_preserves_replies(engine_f, cache_bytes, policy)
 
         immediate, stats = _generate(e, after, sampling, policy=policy, tokens=16)
         # Saved attention rows retain MTP, but not DFlash2's unsaved draft cache.
-        assert stats["cached"] == (len(prompt) - 1 if cache_bytes and policy == "2" else 0)
+        assert stats["cached"] == (len(prompt) if cache_bytes and policy == "2" else 0)
         _generate(e, other, sampling, policy=policy, tokens=16)
         switched, _ = _generate(e, after + [33], sampling, policy=policy, tokens=16)
         _forget(e)
@@ -441,7 +474,7 @@ def test_exl3_checkpoint_resumes(engine_x):
     reply, _ = _generate(engine_x, first, sampling, policy="auto:1:1:0", tokens=20)
     after = first + reply + [31, 32]
     warm, stats = _generate(engine_x, after, sampling)
-    assert stats["cached"] == len(first) - 1
+    assert stats["cached"] == len(first)
     _forget(engine_x)
     cold, stats = _generate(engine_x, after, sampling)
     assert stats["cached"] == 0 and warm == cold
@@ -558,7 +591,7 @@ def test_mtp_off_resumes(engine_off):
     after = first + reply + [21, 22]
     for policy in ("auto", "2", "f3"):
         warm, stats = _generate(engine_off, after, sampling, policy=policy)
-        assert stats["cached"] == len(first) - 1, policy
+        assert stats["cached"] == len(first), policy
         _forget(engine_off)
         cold, stats = _generate(engine_off, after, sampling, policy=policy)
         assert stats["cached"] == 0 and warm == cold, policy
@@ -610,47 +643,39 @@ def test_long_prompt_chunks_leave_the_same_state(engine_long):
 
 
 @pytest.mark.parametrize("sampling", [None, Sampling(19, 0.8, 10, 0.9)])
-def test_identical_resend_and_thinking_turn_reuse_prompt_prefix(engine, sampling):
+def test_identical_resend_replays_and_thinking_turn_is_fresh(engine, sampling):
+    """Mia's 0008 keeps the prompt's own end state (with its head's logits row, 0042): an identical resend replays
+    it (``cached == len(prompt)``, nothing prefilled, the same reply); a thinking turn that ends the prompt
+    differently shares no kept state by default and prefills fresh (TF_GLM_SHARED_PREFIX would resume it)."""
+
     _forget(engine)
     prompt = list(range(11, 30))
     cold, _ = _generate(engine, prompt, sampling, tokens=8)
     repeated, stats = _generate(engine, prompt, sampling, tokens=8)
-    assert stats["cached"] == len(prompt) - 1
+    assert stats["cached"] == len(prompt)               # a replay from the kept head's row
     assert repeated == cold
     fresh, _ = _generate(engine, prompt, sampling, tokens=8, draft=False)
     assert repeated == fresh
     turn = prompt[:-1] + [271, 77, 78]
     resumed, stats = _generate(engine, turn, sampling, tokens=8)
-    assert stats["cached"] == len(prompt) - 1
+    assert stats["cached"] == 0
     fresh, _ = _generate(engine, turn, sampling, tokens=8, draft=False)
     assert resumed == fresh
 
 
 @pytest.mark.parametrize("point", [1, 5, 128])
-def test_prompt_cut_keeps_fresh_prefix_bits_and_full_forward(engine_f, point, monkeypatch):
+def test_prompt_prefix_committed_without_sampling_equals_a_fresh_prefill(engine_f, point):
+    """``prefill(sample=False)`` commits a prompt prefix without a head or first token, leaving the state a prompt
+    of that length leaves (Mia's 0008): a snapshot taken there equals a fresh prefill of ``prompt[:point]``."""
+
     from tensorfold.families.glm5_next.cuda import decode
 
     e, drafter = engine_f.e, engine_f.drafter
     prompt = list(range(11, 140))
-    decode.prefill(e, prompt, None, drafter=drafter)
-    full = [x.clone() for x in _state(e)]
-    hidden = e.last_hidden.clone()
-    calls, kept = [], []
-    compute = decode.compute
-
-    def counted(*args, **kwargs):
-        calls.append(args[3])
-        return compute(*args, **kwargs)
-
-    monkeypatch.setattr(decode, "compute", counted)
-    decode.prefill(e, prompt, None, drafter=drafter, keep_at=point, keep=kept.append)
-    assert calls == [len(prompt)]
-    assert torch.equal(e.last_hidden, hidden)
-    for actual, expected in zip(_state(e), full):
-        assert torch.equal(actual, expected)
+    assert decode.prefill(e, prompt[:point], None, drafter=drafter, sample=False) is None
+    snap = decode.take_snapshot(e, prompt[:point], e.last_hidden, mtp=True, drafter=drafter)
     decode.prefill(e, prompt[:point], None, drafter=drafter)
     fresh = decode.take_snapshot(e, prompt[:point], e.last_hidden, mtp=True, drafter=drafter)
-    snap = kept[0]
     for name in ("rec", "conv", "pending"):
         assert torch.equal(getattr(snap, name), getattr(fresh, name)), name
     assert snap.mtp_len == fresh.mtp_len
@@ -670,10 +695,10 @@ def test_three_resends_preserve_every_kept_glm_state(engine, sampling):
     different = system + [301, 302, 303, 304]
     for step, tokens in enumerate((system + [501], prompt, prompt, prompt, turn, different)):
         actual, stats = _generate(engine, tokens, sampling, tokens=8)
-        if step in (2, 3, 4):
-            assert stats["cached"] == len(prompt) - 1
-        if step == 5:
-            assert stats["cached"] == len(system)
+        if step in (2, 3):
+            assert stats["cached"] == len(prompt)       # an identical resend replays the kept end state (0042)
+        if step in (4, 5):
+            assert stats["cached"] == 0                 # a different ending shares no kept state (no shared prefix)
         first = decode.prefill(ref, tokens, sampling)
         same_tokens(actual, decode.serial_decode(ref, first, 8, sampling).tokens)
         for snap in engine.cache:
@@ -689,3 +714,84 @@ def test_three_resends_preserve_every_kept_glm_state(engine, sampling):
                 if live is not None and snap.mtp_len:
                     index = next(i for i, v in enumerate(views) if v.data_ptr() == live.data_ptr())
                     assert torch.equal(stored[index], getattr(ref.st, name)[:snap.mtp_len]), (step, name)
+
+
+def test_shared_prefix_states_resume_and_equal_fresh(engine_f, monkeypatch):
+    """TF_GLM_SHARED_PREFIX: a request keeps its state where its prompt stops sharing a kept one; a third prompt
+    sharing only that prefix resumes from it (cached == the shared point) and its reply equals a fresh prefill's,
+    with the ring drafter's window carried along."""
+
+    from tensorfold.families.glm5_next.cuda.engine import shared_prefix
+
+    e = engine_f
+    _forget(e)
+    monkeypatch.setattr(e, "shared", shared_prefix("32"))
+    monkeypatch.setattr(e, "opener", None)                 # share by the longest common prefix only, not the opener
+    system = list(range(11, 70))                           # 59 shared tokens
+    sampling = Sampling(5, 1.0, 20, 0.95)
+    _generate(e, system + list(range(100, 140)), sampling, policy="f3", tokens=16)       # chat A
+    _, stats = _generate(e, system + list(range(200, 230)), sampling, policy="f3", tokens=16)   # chat B
+    assert stats.get("shared") == [59]                     # B kept a shared-prefix state at the system block
+    other = system + list(range(300, 320))                 # chat C shares only the system block
+    warm, stats = _generate(e, other, sampling, policy="f3", tokens=16)
+    assert stats["cached"] == 59
+    _forget(e)
+    cold, stats = _generate(e, other, sampling, policy="f3", tokens=16)
+    assert stats["cached"] == 0 and warm == cold
+
+
+def test_a_stop_vote_ends_the_reply_early(engine):
+    """A stop rank 0's on_tokens asks for (``decode.StopVote``) ends the run within a round or two; the reply is a
+    prefix of the one that runs to max_tokens, and stats report it stopped."""
+
+    _forget(engine)
+    prompt = list(range(11, 30))
+    full, _ = _generate(engine, prompt, None, tokens=24)
+    _forget(engine)
+    seen: list[int] = []
+
+    def on_tokens(new):
+        seen.extend(new)
+        return len(seen) >= 5                               # True asks the engine to stop
+
+    engine.request.policy = None
+    engine.request.stop_eos = False
+    stats = engine.generate(list(prompt), 24, None, on_tokens, draft=True)
+    assert stats.get("stopped") is True
+    assert 5 <= len(seen) < 24 and seen == full[:len(seen)]
+
+
+def test_shared_and_stop_unit_helpers():
+    """CPU: the shared-prefix arithmetic, the role-token readers, and the StopVote gather, without a GPU."""
+
+    from pathlib import Path
+
+    from tensorfold.families.glm5_next.cuda import decode
+    from tensorfold.families.glm5_next.cuda.engine import (common_prefix, shared_points, shared_prefix, user_opener)
+    from tensorfold.families.glm5_next.cuda.weights import assistant_end
+
+    assert shared_prefix("") == 0 and shared_prefix("1") == 256 and shared_prefix("64") == 64
+    with pytest.raises(ValueError):
+        shared_prefix("8")                                 # below SHARED_MIN
+    assert common_prefix([1, 2, 3, 9], [1, 2, 3, 4]) == 3 and common_prefix([], [1]) == 0
+    # at most two points, each adding >= least past the cut and the other, short of the own point, on the grid
+    pts = shared_points(list(range(20)), cut=2, point=18, grid=0, least=4, known=[list(range(12))], opener=7)
+    assert pts == [7, 12]
+    assert shared_points(list(range(20)), 2, 18, 0, 4, [], opener=None) == []
+
+    model = Path(__import__("os").environ.get("TENSORFOLD_REDSNOW_MODEL", "/var/tmp/models/RED-SNOW-5.3-FLASH-EXL3-SAGE-4.91bpw"))
+    if (model / "tokenizer.json").is_file():               # RED-SNOW, read-only
+        assert user_opener(model) == 154827
+        import os
+        os.environ.pop("TF_GLM_ASSISTANT_ENDS", None)
+        assert assistant_end(model) is None
+        os.environ["TF_GLM_ASSISTANT_ENDS"] = "1"
+        try:
+            assert assistant_end(model) == 154828
+        finally:
+            os.environ.pop("TF_GLM_ASSISTANT_ENDS", None)
+
+    vote = decode.StopVote(lambda toks: True)
+    assert vote([1]) is True and vote.mine
+    got = vote.gather(lambda words: words[None].repeat(2, 1))(torch.zeros(3))
+    assert got.shape == (2, 3) and vote.stop                # a rank asked: agreed on the next sample

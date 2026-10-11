@@ -53,9 +53,13 @@ def test_string_arguments_keep_their_exact_text(parser):
 
 @PARSERS
 def test_string_typed_values_that_look_like_json_stay_text(parser):
+    # a nullable string's ``null`` is None (as vLLM's GLM parser reads it; the template renders None back as null)
     text = ("<tool_call>get_weather<arg_key>units</arg_key><arg_value>null</arg_value>"
             "<arg_key>zip</arg_key><arg_value>02134</arg_value></tool_call>")
-    assert _parse(parser, text)[1] == [("get_weather", {"units": "null", "zip": "02134"})]
+    assert _parse(parser, text)[1] == [("get_weather", {"units": None, "zip": "02134"})]
+    text = ("<tool_call>get_weather<arg_key>units</arg_key><arg_value>metric</arg_value>"
+            "<arg_key>zip</arg_key><arg_value>null</arg_value></tool_call>")
+    assert _parse(parser, text)[1] == [("get_weather", {"units": "metric", "zip": "null"})]
 
 
 @PARSERS

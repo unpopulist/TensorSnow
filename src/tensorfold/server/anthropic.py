@@ -5,7 +5,7 @@ import json
 from typing import Any
 
 from tensorfold.server.anthropic_translate import Reply, error, translate
-from tensorfold.server.errors import CapacityError, RequestError
+from tensorfold.server.errors import RequestError, admission_response
 from tensorfold.server.request_body import read_body
 from tensorfold.server.responses import LIMIT, Wire, _run_chat, _send
 
@@ -63,8 +63,8 @@ def post(handler: Any, app: Any) -> None:
         if count:
             return _send(handler, 200, {"input_tokens": count_tokens(app, chat)})
     except (RequestError, ValueError, UnicodeDecodeError) as exc:
-        return _send(handler, 503 if isinstance(exc, CapacityError) else 400,
-                     error(str(exc), 503 if isinstance(exc, CapacityError) else 400))
+        status, headers = admission_response(exc)       # 429 + Retry-After for a capacity refusal
+        return _send(handler, status, error(str(exc), status), headers)
 
     def send(event: dict[str, Any]) -> None:
         handler.wfile.write(f"event: {event['type']}\ndata: {json.dumps(event)}\n\n".encode())
@@ -90,7 +90,7 @@ def post(handler: Any, app: Any) -> None:
         if wire.status != 200:
             problem = payload.get("error") or {}
             message = problem.get("message", "request failed") if isinstance(problem, dict) else str(problem)
-            return _send(handler, wire.status, error(message, wire.status))
+            return _send(handler, wire.status, error(message, wire.status), wire.headers())
         _send(handler, 200, reply.completion(payload))
     except OSError:
         handler.close_connection = True

@@ -273,6 +273,13 @@ def _serve_cuda(args: argparse.Namespace, family: Any, model_dir: Path, context:
         options["parallel"] = streams
     if getattr(args, "checkpoint_slots", None) is not None and getattr(family.package, "CUDA_CHECKPOINT_SLOTS", False):
         options["checkpoint_slots"] = int(args.checkpoint_slots)
+    from tensorfold.cuda.spill import SpillConfig
+
+    spill = SpillConfig.from_args(args)
+    if spill is not None:
+        if not getattr(family.package, "CUDA_SPILL", False):
+            raise ValueError(f"--spill-gib: {family.title}'s CUDA engine has no spill tier yet (MLX has one)")
+        options["spill"] = spill
     served = args.name or (args.model.rstrip("/").split("/")[-1] if hub.is_repo_id(args.model) else model_dir.name)
     where = f", rank {args.rank} of {args.tp}" if args.tp > 1 else ""
     print(f"[tensorfold] loading {served}: {family.title} ({family.model_type}) on CUDA{where}", flush=True)
@@ -324,8 +331,35 @@ def _serve_cuda(args: argparse.Namespace, family: Any, model_dir: Path, context:
     note = thinking_notes.startup(model_dir, bool(args.thinking))
     if note:
         print(note, flush=True)
+    if spill is not None:
+        app.on_exit = lambda: _flush_on_exit(getattr(app, "engine", None) or engine, app, spill.flush_s)
     serve(app, args.host, int(args.port))
     return 0
+
+
+def _flush_on_exit(engine: Any, app: Any, budget: float = 60.0) -> None:
+    """--spill-gib on CUDA: on a SIGTERM (docker stop) or Ctrl-C the server writes what the engine keeps in memory to
+    the spill tier (newest first, as many as ``budget`` seconds allow; every rank, through the engine's own messages)
+    before it exits. Best effort: a SIGKILL or a crash skips it; give docker stop the budget plus some."""
+
+    t = time.perf_counter()
+    ok = False
+    scheduler = getattr(engine, "scheduler", None)
+    if scheduler is not None and hasattr(scheduler, "flush_spill"):        # --parallel: between iterations
+        ok = scheduler.flush_spill(budget + 15.0)
+    elif hasattr(engine, "flush_spill"):                                   # one request at a time: between requests
+        turns = getattr(app, "_turns", None)
+        turns = turns() if callable(turns) else None
+        if turns is not None:
+            turns.take(False, None)
+        try:
+            engine.flush_spill(budget)
+            ok = True
+        finally:
+            if turns is not None:
+                turns.give()
+    print(f"[tensorfold] spill: shutdown flush {'done' if ok else 'not finished'} in {time.perf_counter() - t:.1f}s",
+          flush=True)
 
 
 # a resume point begins a prompt chunk when at least this many tokens follow the last chunk start
@@ -333,10 +367,10 @@ MIN_CHUNK = 256
 
 
 def _parallel(value: Any) -> int:
-    """``--parallel``: "auto" is up to 8 requests at once; a number caps it."""
+    """``--parallel``: "auto" is up to 4 requests at once (this deployment's ceiling); a number caps it."""
 
     if str(value).strip().lower() == "auto":
-        return 8
+        return 4
     try:
         return max(1, int(value))
     except ValueError:
@@ -356,6 +390,11 @@ def cmd_serve(args: argparse.Namespace) -> int:
         news = update.first_run_notice()
         if news:
             print(news, flush=True)
+    if getattr(args, "chat_template", None):
+        template_path = Path(args.chat_template).expanduser()
+        if not template_path.is_file():
+            raise FileNotFoundError(f"--chat-template {args.chat_template}: no such file")
+        os.environ["TF_GLM_CHAT_TEMPLATE"] = str(template_path)   # ChatTemplate reads it; the checkpoint is untouched
     config_dir = _config_dir(args.model)
     family = families.detect(config_dir)
     if args.ssd_experts is not None and (args.ssd_experts <= 0 or not hasattr(family.package, "expert_bytes")):

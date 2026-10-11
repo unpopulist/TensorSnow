@@ -222,7 +222,7 @@ def usage(value: dict[str, Any]) -> dict[str, Any]:
 
 def error(message: str, status: int = 400) -> dict[str, Any]:
     kind = ("invalid_request_error" if status == 400 else "not_found_error" if status == 404 else
-            "overloaded_error" if status == 503 else "api_error")
+            "rate_limit_error" if status == 429 else "overloaded_error" if status == 503 else "api_error")
     return {"type": "error", "error": {"type": kind, "message": message}}
 
 

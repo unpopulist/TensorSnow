@@ -16,6 +16,8 @@ pytestmark = pytest.mark.torch
 class Snap:
     def __init__(self, ids, need, states=5):
         self.ids, self.need, self.states, self.rows, self.nbytes = list(ids), need, states, None, 0
+        self.drafter_end, self.drafter_rows = -1, None
+        self.key, self.images = list(ids), False
 
 
 @pytest.fixture
@@ -23,11 +25,11 @@ def kept(monkeypatch):
     """An engine with only its kept-conversation state; save_rows records the saved bytes of every snapshot."""
     made, peaks = [], []
 
-    def save_rows(e, snap):
+    def save_rows(e, snap, drafter=None):    # drafter: 0015's shared-state window
         snap.rows, snap.nbytes = object(), snap.need
         peaks.append(sum(s.nbytes for s in made if s.rows is not None) + sum(s.states for s in made if s in e.cache))
 
-    decode = SimpleNamespace(row_bytes=lambda e, s: s.need, save_rows=save_rows,
+    decode = SimpleNamespace(row_bytes=lambda e, s, drafter=None: s.need, save_rows=save_rows,
                              snapshot_bytes=lambda s: s.states + (s.nbytes if s.rows is not None else 0))
     monkeypatch.setitem(sys.modules, "tensorfold.families.glm5_next.cuda.decode", decode)
     engine = GlmEngine.__new__(GlmEngine)

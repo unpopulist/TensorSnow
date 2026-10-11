@@ -6,3 +6,17 @@ TensorFold is licensed under the Apache License, Version 2.0 (LICENSE) from 0.6.
 Releases up to 0.5.0 were MIT-licensed, and code written before 0.6.0 keeps its
 MIT notice in LICENSES/MIT.txt. Third-party code and its licenses are listed in
 THIRD_PARTY_NOTICES.md.
+
+This tree adds a port of GLM-5.3-Flash EXL3 serving to two NVIDIA DGX Sparks (deploy/redsnow, the RED-SNOW work).
+It contains code adapted from, or written after, these Apache-2.0 projects; details per file are in
+THIRD_PARTY_NOTICES.md ("RED-SNOW port") and in the files' own headers:
+
+- MiaAI-Lab, GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold (patch series against TensorFold v0.6.0)
+  https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold
+  Copyright 2026 MiaAI-Lab and the contributors named in THIRD_PARTY_NOTICES.md. Apache License 2.0.
+- b12x "RoCEnante" RoCE transport (src/tensorfold/cuda/roce_proxy.c, roce.cu, roce.cpp, roce.py)
+  https://github.com/local-inference-lab/b12x
+  Copyright the b12x contributors. Apache License 2.0.
+- jayleaton/glm53-tensorfold-spark
+  https://github.com/jayleaton/glm53-tensorfold-spark
+  Copyright 2026 Jay Leaton. Apache License 2.0.
