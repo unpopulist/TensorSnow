@@ -42,7 +42,7 @@ def _ext():
     here = Path(__file__).parent
     srcs = [str(here / f) for f in ("experts.cpp", "experts.cu", "experts_cb0.cu", "experts_cb1.cu", "experts_cb2.cu",
                                     "experts_pcb0.cu", "experts_pcb1.cu", "experts_pcb2.cu")]
-    return load(name="tensorfold_exl3_experts_v3", sources=srcs, extra_cuda_cflags=["-O3", "-lineinfo"],
+    return load(name="tensorfold_exl3_experts_v4", sources=srcs, extra_cuda_cflags=["-O3", "-lineinfo"],
                 verbose=False)
 
 
@@ -200,8 +200,9 @@ class Scratch:
 
 def routed(x: torch.Tensor, pick: torch.Tensor, wts: torch.Tensor | None, ex: Exl3RoutedExperts, s: Scratch,
            out: torch.Tensor | None, R: int, limit: float = math.inf, act_mode: int = ACT_F32,
-           group: bool = True) -> torch.Tensor:
-    """Routed experts of R rows (picks >= E skipped): Y per slot, or ``out`` = the wts-weighted sum when ``wts``; no host sync."""
+           group: bool = True, order: int = 0) -> torch.Tensor:
+    """Routed experts of R rows (picks >= E skipped): Y per slot, or ``out`` = the wts-weighted sum when ``wts``; no host sync.
+    ``order``: the decode kernel's program launch order (0, 1 or 2; the same bits, ``grouped_kernel``'s SWZ)."""
 
     ext = _ext()
     D, I, E = ex.dims, ex.width, ex.count
@@ -230,7 +231,9 @@ def routed(x: torch.Tensor, pick: torch.Tensor, wts: torch.Tensor | None, ex: Ex
             out = torch.empty((R, D), dtype=torch.float32, device=x.device)
         ext.combine(s.y, wts, out, R, D, slots)
         return out
-    ld = LOADS if ex.aligned16 else 0
+    if order not in (0, 1, 2):
+        raise ValueError(f"decode expert kernel launch order: 0, 1 or 2, not {order!r}")
+    ld = (LOADS if ex.aligned16 else 0) | (order << 2)          # the extension's ld: loads | order << 2
     nt, w, sk, pf = s.cfg_gu
     ext.grouped(s.xg, s.xu, ex.gate_ptr, ex.up_ptr, ex.gate_k2, ex.up_k2, ids, s.count, members, s.z, 2, D, I,
                 P, sk, slots, ex.cb, nt, w, pf, ex.k2_gu[0], ex.k2_gu[1], ex.svh_d, s.y, False, ld)

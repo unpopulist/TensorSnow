@@ -136,3 +136,6 @@ class SelectScratch:
         self.tokens = torch.full((rows, TOKENS), -1, dtype=torch.int32, device=device)
         self.counts = torch.zeros((rows,), dtype=torch.int32, device=device)
         self.split = split_scratch(rows, pools, device)
+        # Mia's 0107: seg_scores.cu's pool table (the segments _seg_scores still scores), allocated here and not at
+        # its first use, which may be inside a graph capture
+        self.seg_scores_pools = torch.zeros((MAX_SEGS,), dtype=torch.int32, device=device)

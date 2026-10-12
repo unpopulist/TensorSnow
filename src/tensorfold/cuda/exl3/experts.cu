@@ -310,7 +310,8 @@ void exl3x_grouped_cuda(const at::Tensor& X0, const at::Tensor& X1, const at::Te
     a.K = (int)K; a.N = (int)N; a.P = (int)P; a.SK = (int)SK; a.maxm = (int)members.size(1); a.slots = (int)slots;
     a.nexp_max = (int)uids.size(0);
     a.mats = (int)mats; a.nt = (int)nt; a.warps = (int)warps; a.pf = (int)pf; a.lo = (int)lo; a.hi = (int)hi;
-    a.ld = (int)ld;
+    a.ld = (int)(ld & 3);
+    a.swz = (int)(ld >> 2);
     TORCH_CHECK(!fuse || (mats == 1 && SK == 1 && nt * 16 == 128), "the fused down epilogue: one matrix, one split, 128 columns");
     a.svh_d = fuse ? reinterpret_cast<const half*>(svh_d.data_ptr()) : nullptr;
     a.y = fuse ? y.data_ptr<float>() : nullptr;

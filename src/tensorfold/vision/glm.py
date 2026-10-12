@@ -741,7 +741,9 @@ class GlmVision:
                 pieces.append(_as_text(rest[:v]) + "<|begin_of_video|>" + frames + "<|end_of_video|>")
                 items.append(("video", clip.frames))
                 rest = rest[v + len(VIDEO_SPAN):]
-        ids = self.tok.encode("".join(pieces), add_special_tokens=False).ids
+        # patch 0099: the batch call tokenizes with Python's GIL released (encode holds it, ~1.2 us a token: a long
+        # prompt with a picture stopped the engine loop and every other stream), the same ids (as App._encode_ids)
+        ids = self.tok.encode_batch_fast(["".join(pieces)], add_special_tokens=False)[0].ids
         if max_prompt_tokens and len(ids) >= max_prompt_tokens:
             # v0.6.0's context refusal wording (68c6e35, Apache-2.0): served as context_length_exceeded
             raise ValueError(f"{CONTEXT_LIMIT} {max_prompt_tokens} tokens: the prompt with its images is {len(ids):,} "

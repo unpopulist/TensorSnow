@@ -180,7 +180,21 @@ class DraftContext:
         self.kc = [c[:, slot * cap:(slot + 1) * cap] for c in owner.kc]
         self.vc = [c[:, slot * cap:(slot + 1) * cap] for c in owner.vc]
         self.pos_dev = owner.pos[slot:slot + 1]          # the device mirror of context_end (put_window fills it)
+        self.gen = 0                    # bumped by every change of this context (``context_end``)
         self.context_end = 0
+
+    @property
+    def context_end(self) -> int:
+        return self._end
+
+    @context_end.setter
+    def context_end(self, value: int) -> None:
+        # (Mia's 0100) every change of this stream's context (taps, a restore, a reset, a capture) goes through here
+        # and outdates a block pass of this slot launched ahead (``MultiDrafter.prelaunch``): a pass reads only its
+        # own slots' rows, so another slot's change (a prompt chunk, an admission) does not. A reslot swaps whole
+        # context objects (each keeps its pool slot, rows and generation), so it outdates nothing.
+        self._end = value
+        self.gen += 1
 
     def reset(self) -> None:
         self.context_end = 0
@@ -223,6 +237,8 @@ class MultiDrafter:
 
     def __init__(self, drafter: Drafter, streams: int, *, tap_rows: int | None = None) -> None:
         d = self.d = drafter
+        self._pre = None                # the ``_key`` of the block pass launched ahead (``prelaunch``), or None
+        self.ahead = [0, 0]             # block passes launched ahead, and the ones a ``candidates`` call took
         if streams < 1:
             raise ValueError("a multi-stream drafter needs at least one stream")
         self.streams = streams
@@ -458,17 +474,26 @@ class MultiDrafter:
             self._launch_taps(pieces)
 
     # -- drafts -------------------------------------------------------------------------------------------------
-    @torch.no_grad()
-    def candidates(self, reqs: Sequence[tuple[DraftContext, int, int]]) -> list[tuple[np.ndarray, ...]]:
-        """(stream, pending, depth) -> each stream's ``Drafter.candidates(pending, depth)``: one batched pass."""
-
-        S, St = len(reqs), self.streams
+    def _check_block(self, ctxs: Sequence[DraftContext]) -> None:
+        S, St = len(ctxs), self.streams
         if not 1 <= S <= St:
             raise ValueError(f"a block pass takes 1..{St} streams, got {S}")
-        if len({c.slot for c, _, _ in reqs}) != S or any(c.owner is not self for c, _, _ in reqs):
+        if len({c.slot for c in ctxs}) != S or any(c.owner is not self for c in ctxs):
             raise ValueError("a block pass takes each of this drafter's streams at most once")
+
+    @staticmethod
+    def _key(reqs: Sequence[tuple]) -> tuple:
+        """A block pass's inputs: its streams' pool slots in order, their pending tokens and their contexts'
+        generations (a context's end, and the rows below it, change only with its generation)."""
+        return tuple((r[0].slot, int(r[1]), r[0].gen) for r in reqs)
+
+    def _launch_block(self, reqs: Sequence[tuple[DraftContext, int]]) -> tuple:
+        """One batched block pass for (stream, pending) and its candidates' copy to ``cand_host`` (``cand_ready``
+        records its end); returns the pass's ``_key``."""
+
+        S, St = len(reqs), self.streams
         h = self.b_host
-        for s, (c, pending, _) in enumerate(reqs):
+        for s, (c, pending) in enumerate(reqs):
             h[s], h[St + s], h[2 * St + s] = int(pending), c.slot, c.context_end
         self.b_meta.copy_(h, non_blocking=True)
         g = self.block_graphs.get(S)
@@ -476,18 +501,59 @@ class MultiDrafter:
             g.replay()
         else:
             self._block_compute(S)
+        if self.cand_ready is not None:
+            self.cand_host.copy_(self.cand, non_blocking=True)
+            self.cand_ready.record()
+        else:
+            self.cand_host.copy_(self.cand)
+        return self._key(reqs)
+
+    @torch.no_grad()
+    def prelaunch(self, reqs: Sequence[tuple[DraftContext, int]]) -> None:
+        """(Mia's 0100) Launch now the block pass a later ``candidates`` call will ask for (the next round's, from the
+        end of this one, so it runs while the host finishes the round and rank 0's message goes out). Every rank
+        calls it at the same point with the same streams (its all-gather pairs up). ``candidates`` with the same
+        streams and pending tokens, none of their contexts changed in between (``DraftContext.gen``), only waits for
+        it; any other call runs its own pass. The pass's inputs are the ones ``candidates`` would give it, so its
+        candidates and the drafts chosen from them are the same."""
+
+        if not reqs:
+            return
+        self._check_block([c for c, _ in reqs])
+        if self._pre is not None and self.cand_ready is not None:
+            self.cand_ready.synchronize()              # an unused pass ahead still reads b_host
+        self._pre = self._launch_block(reqs)
+        self.ahead[0] += 1
+
+    @torch.no_grad()
+    def candidates(self, reqs: Sequence[tuple[DraftContext, int, int]]) -> list[tuple[np.ndarray, ...]]:
+        """(stream, pending, depth) -> each stream's ``Drafter.candidates(pending, depth)``: one batched pass (or the
+        one ``prelaunch`` started for exactly these inputs)."""
+
+        S, St = len(reqs), self.streams
+        self._check_block([c for c, _, _ in reqs])
+        pre, self._pre = self._pre, None
+        if pre == self._key(reqs):
+            self.ahead[1] += 1
+        else:
+            if pre is not None and self.cand_ready is not None:
+                self.cand_ready.synchronize()          # the unused pass ahead still reads b_host
+            self._launch_block([(c, p) for c, p, _ in reqs])
         d = self.d
         m, k = self.block - 1, d.top_k
         vocab = d.succ.shape[0]
-        # one pinned copy of every stream's candidates and projected rows; ids outside the vocabulary (Mia's 0092: a
-        # read-back that raced the pass) are copied again once, after a full device sync, before they fail the round
+        # one pinned copy of every stream's candidates and projected rows (the first went out with the pass); ids
+        # outside the vocabulary (Mia's 0092: a read-back that raced the pass) are copied again once, after a full
+        # device sync, before they fail the round
         for attempt in (0, 1):
+            if attempt:
+                if self.cand_ready is not None:
+                    self.cand_host.copy_(self.cand, non_blocking=True)
+                    self.cand_ready.record()
+                else:
+                    self.cand_host.copy_(self.cand)
             if self.cand_ready is not None:
-                self.cand_host.copy_(self.cand, non_blocking=True)
-                self.cand_ready.record()
                 self.cand_ready.synchronize()
-            else:
-                self.cand_host.copy_(self.cand)
             g_all = self.cand_host[:d.gathered * S * m * 2 * k].view(d.gathered, S * m, 2 * k)
             p_all = self.cand_host[self.cand_n:].view(St * m, -1)
             try:

@@ -52,7 +52,9 @@ void grouped(const at::Tensor& X0, const at::Tensor& X1, const at::Tensor& TP0, 
         TORCH_CHECK(y.numel() >= P * N, "y too small");
     }
     TORCH_CHECK(X0.numel() >= P * K && X1.numel() >= P * K, "X too small");
-    TORCH_CHECK(ld == 0 || ld == 1, "loads: 0 (32-bit) or 1 (16-byte, every trellis 16-byte aligned)");
+    // ld's low bits: the loads; ld >> 2: the programs' launch order (TF_GLM_EXL3_DEC_ORDER, after Mia's 0090)
+    TORCH_CHECK((ld & 3) == 0 || (ld & 3) == 1, "loads: 0 (32-bit) or 1 (16-byte, every trellis 16-byte aligned)");
+    TORCH_CHECK(ld >= 0 && (ld >> 2) <= 2, "decode expert kernel: launch order 0, 1 or 2");
     c10::cuda::CUDAGuard guard(X0.device());
     exl3x_grouped_cuda(X0, X1, TP0, TP1, B0, B1, uids, ucount, members, Z, mats, K, N, P, SK, slots, cb, nt, warps,
                        pf, lo, hi, svh_d, y, fuse, ld);

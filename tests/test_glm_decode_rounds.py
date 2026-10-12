@@ -138,8 +138,14 @@ def test_decode_kernel_code(monkeypatch):
     monkeypatch.setenv("TF_GLM_HC_DEC", "0")
     monkeypatch.setenv("TF_GLM_LATENT_STAGES", "1")
     monkeypatch.setenv("TF_GLM_COMBINE_SY", "0")
+    from tensorfold.families.glm5_next.cuda import exl3_generic
+
+    monkeypatch.setattr(exl3_generic, "DEC_ORDER", 2)
     code = E.decode_kernel_code()
-    assert len(code) == 6 and code[0] == 0 and code[2] == 1 and code[3] == 0
+    assert len(code) == 7 and code[0] == 0 and code[2] == 1 and code[3] == 0 and code[6] == 2
+    monkeypatch.setenv("TF_GLM_EXL3_DEC_ORDER", "3")
+    with pytest.raises(ValueError):
+        exl3_generic.dec_order()
 
 
 def test_merge_candidates_refuses_ids_outside_the_vocabulary():

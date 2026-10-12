@@ -80,6 +80,12 @@ KDA_CHUNKED="${KDA_CHUNKED:-1}"
 MULTI_PREFILL="${MULTI_PREFILL:-1}"   # TF_GLM_MULTI_PREFILL: waiting prompts share prompt chunks
 FILL_BUDGET_MS="${FILL_BUDGET_MS:-200}"   # TF_GLM_FILL_BUDGET_MS: prompt chunks in layer slices while others decode
 FILL_DRAFTS="${FILL_DRAFTS:-1}"   # TF_GLM_FILL_DRAFTS: drafted decode rounds between those slices
+# TF_GLM_FILL_ROWS (BadAd84's FILL_ROWS in Mia's recipe): a prompt chunk's rows while others decode. 2048 (TensorFold's
+# own default is 1024) is the whole prompt chunk, whose buffers already exist: the same memory, the same replies, half
+# the passes over the expert weights. At most the prompt chunk (the engine refuses more; this tree's is 2048,
+# decode.PREFILL_ROWS); a smaller TF_GLM_PREFILL_ROWS lowers the default with it, as in Mia's config.sh. 1024: as before.
+_fill_max="${TF_GLM_PREFILL_ROWS:-2048}"
+FILL_ROWS="${FILL_ROWS:-${TF_GLM_FILL_ROWS:-$(( _fill_max < 2048 ? _fill_max : 2048 ))}}"
 STREAM_SMOOTH="${STREAM_SMOOTH:-1}"   # TF_GLM_STREAM_SMOOTH (+ _MS 400): steadier token pacing for streamed replies
 CACHE_ENTRIES="${CACHE_ENTRIES:-32}"  # TF_GLM_CACHE_ENTRIES: kept prompt states
 MTP_HEAD="${MTP_HEAD:-auto}"      # TF_GLM_MTP: auto leaves the 1.8 GiB MTP head out beside DFlash2
@@ -89,6 +95,12 @@ COPY_MAX="${COPY_MAX:-15}"        # TF_GLM_COPY_MAX: copy drafts a round (16-row
 DRAFT_POLICY="${DRAFT_POLICY:-fnc7:0.3}"   # TF_GLM_DFLASH_POLICY: up to 7 DFlash2 drafts, cut at noisy chance 0.3
 COPY_CODE="${COPY_CODE:-1}"       # TF_GLM_WIDE_GRAPHS=16 + TF_GLM_COPY_REPLY_MATCH=16 (0: both off)
 L2PF="${L2PF:-1}"                 # TF_GLM_L2PF: next weights into L2 during decode all-gathers (Mia's 0046)
+# TF_GLM_EXL3_DEC_ORDER (Mia's 0090, by Lukasz Raczylo): the decode expert kernel's block launch order, the same bits
+# for every value. 0: as launched (the old order); 1: the 128-column blocks of one k slice together, then the experts;
+# 2: then the matrices, splits and member tiles. Default 2: on RED-SNOW (2026-10-12, six-prompt drafted decode, thinking
+# on) 2 was 0.4-1.2% faster than 0 on every prompt, undrafted decode unchanged.
+EXL3_DEC_ORDER="${EXL3_DEC_ORDER:-2}"
+[[ "$EXL3_DEC_ORDER" =~ ^[012]$ ]] || { printf '[start.sh] refusing: EXL3_DEC_ORDER is 0, 1 or 2, not %s\n' "$EXL3_DEC_ORDER" >&2; exit 1; }
 SHARED_PREFIX="${SHARED_PREFIX:-1}"   # TF_GLM_SHARED_PREFIX: keep the shared system prompt's state (Mia's 0015)
 # TF_GLM_MULTI_LONE (Mia's 0035): a lone request moves to the pool's first rows for the one-stream graphs, evicting the
 # kept prompts there; off, as in MiaAI-Lab's recipe
@@ -269,6 +281,7 @@ COMMON_ENV=(
     TF_GLM_MULTI_PREFILL="$MULTI_PREFILL"
     TF_GLM_FILL_BUDGET_MS="$FILL_BUDGET_MS"
     TF_GLM_FILL_DRAFTS="$FILL_DRAFTS"
+    TF_GLM_FILL_ROWS="$FILL_ROWS"
     TF_GLM_STREAM_SMOOTH="$STREAM_SMOOTH"
     TF_GLM_STREAM_SMOOTH_MS="${STREAM_SMOOTH_MS:-400}"
     TF_GLM_CACHE_ENTRIES="$CACHE_ENTRIES"
@@ -278,6 +291,7 @@ COMMON_ENV=(
     TF_GLM_WIDE_GRAPHS="$([[ "$COPY_CODE" == 1 ]] && echo 16 || echo 0)"
     TF_GLM_COPY_REPLY_MATCH="$([[ "$COPY_CODE" == 1 ]] && echo 16 || echo 0)"
     TF_GLM_L2PF="$L2PF"
+    TF_GLM_EXL3_DEC_ORDER="$EXL3_DEC_ORDER"
     TF_GLM_SHARED_PREFIX="$SHARED_PREFIX"
     TF_GLM_MULTI_LONE="$MULTI_LONE"
     TF_GLM_POOL_STREAMS="$POOL_STREAMS"
@@ -288,9 +302,9 @@ while IFS='=' read -r name _; do
     case "$name" in TENSORFOLD_MEMORY_RESERVE_GIB|TF_GLM_CACHE_GIB|TF_GLM_MTP|TENSORFOLD_NO_UPDATE_CHECK|TENSORFOLD_NUCLEUS_UNION) continue ;; esac
     case "$name" in TF_ROCE_MAX_KB|TF_ROCE_WAIT_S) continue ;; esac   # set above from ROCE_MAX_KB / ROCE_WAIT_S
     case "$name" in TF_GLM_HC_SPLIT|TF_GLM_PREFILL_OVERLAP|TF_GLM_KDA_CHUNKED|TF_GLM_MULTI_PREFILL|TF_GLM_FILL_BUDGET_MS|\
-                    TF_GLM_FILL_DRAFTS|TF_GLM_STREAM_SMOOTH|TF_GLM_STREAM_SMOOTH_MS|TF_GLM_CACHE_ENTRIES) continue ;; esac
+                    TF_GLM_FILL_DRAFTS|TF_GLM_FILL_ROWS|TF_GLM_STREAM_SMOOTH|TF_GLM_STREAM_SMOOTH_MS|TF_GLM_CACHE_ENTRIES) continue ;; esac
     case "$name" in TF_GLM_COPY_DRAFTS|TF_GLM_COPY_MAX|TF_GLM_DFLASH_POLICY|TF_GLM_WIDE_GRAPHS|TF_GLM_COPY_REPLY_MATCH|\
-                    TF_GLM_L2PF|TF_GLM_SHARED_PREFIX|TF_GLM_MULTI_LONE|TF_GLM_POOL_STREAMS) continue ;; esac   # set above from COPY* / DRAFT_POLICY / L2PF / ..
+                    TF_GLM_L2PF|TF_GLM_SHARED_PREFIX|TF_GLM_MULTI_LONE|TF_GLM_POOL_STREAMS|TF_GLM_EXL3_DEC_ORDER) continue ;; esac   # set above from COPY* / DRAFT_POLICY / L2PF / ..
     # TF_ROCE_HCA / TF_ROCE_GID_INDEX name one node's devices: not passed to both (NCCL_IB_* per node instead)
     case "$name" in TF_ROCE_HCA|TF_ROCE_GID_INDEX) continue ;; esac
     case "$name" in TF_SPILL_FLUSH_S) continue ;; esac   # set above from SPILL_FLUSH_S (spill on)

@@ -191,6 +191,17 @@ class Engine:
         ring = ring_enabled(kv) if ring is None else bool(ring)
         self.caches = Caches(w, pool_rows or capacity, kv=kv, streams=streams,
                              ring=index_ring(pool_rows or capacity, max(max_rows, prefill_rows)) if ring else None)
+        # patch 0105: the prompt chunks' CUDA pool scoring (sparse._scores_ext) built / loaded now, before any
+        # request: loaded lazily, a fresh image built it at the first long prompt's chunk while every stream waited
+        # (~23 s). (Mia's 0106 adds latent._onepass_ext here too; RED-SNOW does not port 0106: TP=2's 32 heads keep
+        # Triton there.)
+        if kv == "fp8" and any(l.kind == "dsa" for l in w.layers):
+            from . import sparse
+
+            if sparse.prompt_scores_cuda():
+                sparse._scores_ext()
+            if sparse.seg_scores_cuda():                # patch 0107: the decode windows' scoring, likewise
+                sparse._seg_scores_ext()
         self.slots = Slots(w, streams, max_rows)
         self.home = self.st = State(w, capacity, max_rows, caches=self.caches, slots=self.slots, kv=kv)
         self.last_hidden: torch.Tensor | None = None

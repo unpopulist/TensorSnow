@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import functools
+
 import torch
 import triton
 import triton.language as tl
@@ -135,6 +137,54 @@ def _scores(QI, W, w_stride, PK, PKS, OUT, POS, R, NP, scale, wscale, H: tl.cons
 
 
 SCORE_LOOP = 32            # pool blocks a _scores program takes (speed only; GB10: 32 >= 16 > 8 > 4)
+
+
+TRITON_PTX = "3.7"         # the Triton release whose PTX the CUDA ports reproduce (their bits are its kernels')
+
+
+def triton_matches_ptx() -> bool:
+    """Whether the installed Triton is the release the CUDA ports were read from (TRITON_PTX). Another release may
+    order a kernel's arithmetic differently, and a port would then no longer give its Triton kernel's bits, so the
+    ports are not used with it (logged once; the Triton kernels serve)."""
+    return ".".join(triton.__version__.split(".")[:2]) == TRITON_PTX
+
+
+def prompt_scores_cuda() -> bool:
+    """TF_GLM_SCORES_CUDA (default on): a prompt chunk's FP8 pool scores from prompt_scores.cu, which
+    computes every score with _scores' own instruction sequence (its PTX under Triton TRITON_PTX: the mma K order of
+    Triton's kWidth-4 dot layout, the epilogue's roundings, the head sum's order), so the same bits, with one
+    converted key tile shared by a CTA's 8 rows; 0: _scores (Triton). Off as well when the extension is not used
+    (another Triton release, or a failed build or load: ``_scores_ext``). tools/prompt_scores_check.py."""
+    import os
+
+    return os.environ.get("TF_GLM_SCORES_CUDA", "1") != "0" and _SCORES_FAILED is None
+
+
+_SCORES_EXT = None
+_SCORES_FAILED = None      # why prompt_scores.cu is not used (then _scores serves)
+
+
+def _scores_ext():
+    """The extension, built / loaded once; None when it is not used: under another Triton release than TRITON_PTX,
+    or when its build or load failed (no compiler, a toolkit the kernel does not compile with). Neither stops the
+    start: it is logged once and the Triton kernel serves."""
+    global _SCORES_EXT, _SCORES_FAILED
+    if _SCORES_EXT is None and _SCORES_FAILED is None:
+        from pathlib import Path
+
+        from tensorfold.cuda.build import load
+
+        try:
+            if not triton_matches_ptx():
+                raise RuntimeError(f"Triton {triton.__version__}: the kernel reproduces Triton {TRITON_PTX}'s PTX")
+            _SCORES_EXT = load(name="tensorfold_glm_scores_v1",
+                               sources=[str(Path(__file__).parent / "prompt_scores.cu")],
+                               extra_cuda_cflags=["-O3"], verbose=False)
+        except Exception as exc:
+            _SCORES_FAILED = f"{type(exc).__name__}: {(str(exc).strip().splitlines() or [''])[-1][:200]}"
+            print(f"[tensorfold] prompt_scores.cu is not used ({_SCORES_FAILED}); prompt chunks score with the "
+                  "Triton kernel", flush=True)
+    return _SCORES_EXT
 
 
 @triton.jit
@@ -276,6 +326,123 @@ def top_pools(scores: torch.Tensor, k: int, pos: torch.Tensor | None = None) -> 
     return out
 
 
+# Patch 0101: prompt rows' selection from one pass over the scores instead of _select_rows' five. A row's
+# candidates are every pool whose key is at or above a floor (an upper set of the row's order), compacted in pool
+# order; with between K and CAP of them, the K best of the row are the K best of the candidates and every tie at
+# the K-th best is among them, so _select_rows' radix select and write over the candidates (in registers) take the
+# same pools and ties. Any floor gives the same pools: it is the key prefix (16 bits) of a strided sample's rank
+# that expects about TARGET candidates, and a row whose count misses [K, CAP] (ties, all-equal or skewed scores)
+# takes _select_rows itself. Speed only: CAP, TARGET, the sample, BLOCK and warps (measured on
+# GB10; tools/select_floor_check.py proves the pools).
+PROMPT_TILES = ((12288, 1024, 724), (32768, 2048, 1024), (1 << 62, 4096, 2048))   # (most scores a row, CAP, TARGET)
+PROMPT_SECTORS = 512       # the sample: 512 runs of 8 scores (32 bytes) spread over the row
+
+
+@triton.jit
+def _radix_step(hist, need, prefix, fixed, p: tl.constexpr):
+    """_select_rows' pass p (8 bits from the top) from its histogram: the K-th best's digit into the prefix, the
+    count still needed among the pools equal to the prefix so far, the prefix's fixed bits."""
+    bins = tl.arange(0, 256)
+    at_or_above = tl.sum(hist, 0) - tl.cumsum(hist, 0) + hist           # pools with this digit or a higher one
+    digit = tl.max(tl.where(at_or_above >= need, bins, 0), 0)
+    need -= tl.sum(tl.where(bins > digit, hist, 0), 0)
+    prefix = prefix | (digit.to(tl.uint32) << (24 - 8 * p))
+    fixed = fixed | (tl.full((), 0xFF, tl.uint32) << (24 - 8 * p))
+    return need, prefix, fixed
+
+
+@triton.jit
+def _tile_select(u, idx, ok, OUT, r, K: tl.constexpr):
+    """_select_rows on a tile: keys u of pools idx (ascending) where ok, the K best's pools ascending into OUT[r]."""
+    prefix = tl.zeros((), dtype=tl.uint32)
+    fixed = tl.zeros((), dtype=tl.uint32)
+    need = K
+    for p in tl.static_range(4):
+        hist = tl.histogram(((u >> (24 - 8 * p)) & 0xFF).to(tl.int32), 256, mask=ok & ((u & fixed) == prefix))
+        need, prefix, fixed = _radix_step(hist, need, prefix, fixed, p)
+    eq = (ok & (u == prefix)).to(tl.int32)
+    take = (ok & (u > prefix)) | ((eq == 1) & (tl.cumsum(eq, 0) - eq < need))
+    t = take.to(tl.int32)
+    tl.store(OUT + r * K + tl.cumsum(t, 0) - t, idx.to(tl.int64), mask=take)
+
+
+@triton.jit
+def _sample_floor(row, NP, NS: tl.constexpr, TARGET: tl.constexpr):
+    """A floor key for a row of NP scores: the 16-bit prefix of the sample's rank that scales to TARGET pools (NS
+    runs of 8 scores at even spacing, 32-byte aligned; on rows under NS * 8 scores runs repeat). Speed only."""
+    s = tl.arange(0, NS * 8)
+    j = ((s // 8).to(tl.int64) * NP // NS) // 8 * 8 + s % 8
+    su = _order_key(tl.load(row + j, mask=j < NP, other=0.0))
+    prefix = tl.zeros((), dtype=tl.uint32)
+    fixed = tl.zeros((), dtype=tl.uint32)
+    need = tl.maximum(TARGET * (NS * 8) // NP, 1)
+    for p in tl.static_range(2):
+        hist = tl.histogram(((su >> (24 - 8 * p)) & 0xFF).to(tl.int32), 256, mask=(su & fixed) == prefix)
+        need, prefix, fixed = _radix_step(hist, need, prefix, fixed, p)
+    return prefix
+
+
+@triton.jit
+def _select_floor(S, OUT, CAND, NP, K: tl.constexpr, CAP: tl.constexpr, NS: tl.constexpr, TARGET: tl.constexpr,
+                  BLOCK: tl.constexpr):
+    """Program r: row r's (NP scores) K best pools ascending into OUT[r], as _select_rows (patch 0101's comment
+    above). A row of at most CAP scores is one tile; else one pass compacts the pools at or above the floor
+    (keys, then pools) into CAND[r] (2 * CAP int32), and the tile is those, or the row takes _select_rows."""
+    r = tl.program_id(0).to(tl.int64)
+    row = S + r * NP
+    c = tl.arange(0, CAP)
+    if NP <= CAP:
+        ok = c < NP
+        _tile_select(_order_key(tl.load(row + c, mask=ok, other=0.0)), c, ok, OUT, r, K)
+    else:
+        lo = _sample_floor(row, NP, NS, TARGET)
+        ck = CAND + r * (2 * CAP)
+        n = 0
+        for b in range(0, NP, BLOCK):
+            i = b + tl.arange(0, BLOCK)
+            ok = i < NP
+            u = _order_key(tl.load(row + i, mask=ok, other=0.0))
+            sel = ok & (u >= lo)
+            t = sel.to(tl.int32)
+            m = tl.sum(t, 0)
+            if m > 0:
+                at = n + tl.cumsum(t, 0) - t
+                put = sel & (at < CAP)
+                tl.store(ck + at, u.to(tl.int32, bitcast=True), mask=put)
+                tl.store(ck + CAP + at, i, mask=put)
+            n += m
+        if (n >= K) & (n <= CAP):
+            tl.debug_barrier()                           # the candidates other threads stored, before reading them
+            ok = c < n
+            u = tl.load(ck + c, mask=ok, other=0).to(tl.uint32, bitcast=True)
+            _tile_select(u, tl.load(ck + CAP + c, mask=ok, other=0), ok, OUT, r, K)
+        else:
+            _select_rows(S, OUT, NP, S, K, 1024, False)
+
+
+def prompt_tile(np_: int) -> tuple[int, int]:
+    """_select_floor's CAP and TARGET for rows of np_ scores (speed only)."""
+    return next((cap, target) for most, cap, target in PROMPT_TILES if np_ <= most)
+
+
+def prompt_pools(scores: torch.Tensor, k: int, scratch: torch.Tensor | None = None) -> torch.Tensor:
+    """top_pools' pools for prompt rows (no visible bounds), by _select_floor: one program a row, 4,096 scores a
+    step for blocks of up to 32 rows (fewer programs than the GB10's 48 SMs), else 1,024; ``scratch``: int32, at
+    least R * 2 * CAP (prompt_tile)."""
+    R, NP = scores.shape
+    if NP < k or not scores.is_contiguous():
+        raise ValueError("prompt_pools: contiguous rows of at least k scores")
+    cap, target = prompt_tile(NP)
+    if scratch is None:
+        scratch = torch.empty((R * 2 * cap,), dtype=torch.int32, device=scores.device)
+    elif scratch.dtype != torch.int32 or scratch.numel() < R * 2 * cap:
+        raise ValueError(f"prompt_pools: the scratch needs {R * 2 * cap} int32")
+    out = torch.empty((R, k), dtype=torch.int64, device=scores.device)
+    _select_floor[(R,)](scores, out, scratch, NP, K=k, CAP=cap, NS=PROMPT_SECTORS, TARGET=target,
+                        BLOCK=4096 if R <= 32 else 1024, num_warps=8)
+    return out
+
+
 def pool_bucket(pos: int, R: int, np_max: int) -> int:
     """Pools to score for rows pos .. pos + R - 1: the visible ones rounded up to a power of two (at least 1024), at most the capacity's."""
     visible = (pos + R) // POOL + 1
@@ -358,6 +525,7 @@ def _select_prompt(qi: torch.Tensor, wts: torch.Tensor, pk: torch.Tensor, pos: i
       The scores buffer keeps pool_bucket's size (the allocator's few sizes), used as a contiguous [R, NP] prefix;
     - _scores takes one row a program and SCORE_LOOP pool blocks, a row's keys masked to its own pools before its
       dot;
+    - prompt_pools selects (patch 0101: one pass over the scores, top_pools' pools);
     - one kernel (_tokens) writes tokens and counts with select_tokens' integer formulas."""
 
     dev = qi.device
@@ -373,15 +541,21 @@ def _select_prompt(qi: torch.Tensor, wts: torch.Tensor, pk: torch.Tensor, pos: i
     tokens = torch.empty((R, width), dtype=torch.int32, device=dev)
     counts = torch.empty((R,), dtype=torch.int32, device=dev)
     pkv, pks, rs, fp8 = kv8.parts(pk)
+    cand = torch.empty((B * 2 * prompt_tile(NP)[0],), dtype=torch.int32, device=dev)   # prompt_pools' candidates
     for a in range(0, R, B):
         n = min(B, R - a)
         at = pos_dev if a == 0 else pos_dev + a
         scores = buf[:n * NP].view(n, NP)
-        _scores[(n, triton.cdiv(triton.cdiv(NP, 64), SCORE_LOOP))](qi[a:a + n], wts[a:a + n], wts.stride(0), pkv, pks,
-                                                                   scores, at, n, NP, D ** -0.5, wscale, H=H,
-                                                                   HP=max(16, triton.next_power_of_2(H)), D=D, BP=64,
-                                                                   L=SCORE_LOOP, RS=rs, FP8=fp8, num_warps=4)
-        pools = top_pools(scores, TOPK_POOLS)                                           # ascending pool index
+        ext = _scores_ext() if fp8 and H == 32 and D == 128 and NP % 64 == 0 and prompt_scores_cuda() else None
+        if ext is not None:
+            ext.scores(qi[a:a + n], wts[a:a + n], wts.stride(0), pk, rs, scores, at, n, NP, D ** -0.5, wscale)
+        else:
+            _scores[(n, triton.cdiv(triton.cdiv(NP, 64), SCORE_LOOP))](qi[a:a + n], wts[a:a + n], wts.stride(0), pkv,
+                                                                       pks, scores, at, n, NP, D ** -0.5, wscale, H=H,
+                                                                       HP=max(16, triton.next_power_of_2(H)), D=D,
+                                                                       BP=64, L=SCORE_LOOP, RS=rs, FP8=fp8,
+                                                                       num_warps=4)
+        pools = prompt_pools(scores, TOPK_POOLS, cand)                                  # ascending pool index
         _tokens[(n,)](pools, at, tokens[a:a + n], counts[a:a + n], W=width, K=TOPK_POOLS, PL=POOL, BLOCK=1024,
                       num_warps=4)
     return tokens, counts
@@ -676,9 +850,64 @@ def _seg_select(S, s_stride, POS, SPR, TOK, CNT, W: tl.constexpr, K: tl.constexp
     tl.store(CNT + r, tl.where(NP > K, n, 0).to(tl.int32))
 
 
-SEG_SCORE_GRID = 256       # _seg_scores programs a segment (grid stride over its pool blocks): speed only
+# _seg_scores programs a segment (grid stride over its pool blocks): speed only. Patch 0107: 512 (was 256), long
+# contexts' scoring a little faster (with patch 0085's selection, the indexer call at 1 x 16 rows x 1.04M
+# 1.076 -> 1.043 ms, 4 streams x 8 rows x 590k 1.266 -> 1.243 on GB10), every score's bits unchanged
+SEG_SCORE_GRID = 512
 SEG_SPLIT = True           # seg_select_tokens: the split selection (select_split), else one program a row (_seg_select)
 SEG_SELECT = (4096, 8)     # _seg_select's scores a step and warps: speed only (the selection is exact integer logic)
+# Patch 0107: a segmented window's FP8 scoring: segments of at least SEG_SCORE_CUDA_ROWS rows from seg_scores.cu, the
+# rest from _seg_scores (the same stores, bit for bit, either way); the CUDA kernel's CTAs a segment and raw key tiles
+# in flight. All three speed only (measured on GB10, 1-4 streams x 1-16 rows at 180k-596k)
+SEG_SCORE_CUDA_ROWS = 4
+SEG_SCORE_CTAS = 96
+SEG_SCORE_STAGES = 2
+
+
+def seg_scores_cuda() -> bool:
+    """TF_GLM_SEG_SCORES_CUDA (default on): a segmented decode window's FP8 pool scores for its segments of
+    SEG_SCORE_CUDA_ROWS or more rows from seg_scores.cu, which stores _seg_scores' scores with _scores' instruction
+    sequence (prompt_scores.cu's: the same tile, warps and epilogue), a CTA converting each key tile once for up to 8
+    of a segment's rows instead of once a row; the fewer-row segments (memory-bound, where Triton reads faster) from
+    _seg_scores as before. 0: _seg_scores for all. Off as well when the extension is not used (another Triton release
+    than TRITON_PTX, or a failed build or load: ``_seg_scores_ext``). tools/decode_indexer_check.py."""
+    import os
+
+    return os.environ.get("TF_GLM_SEG_SCORES_CUDA", "1") != "0" and _SEG_SCORES_FAILED is None
+
+
+_SEG_SCORES_EXT = None
+_SEG_SCORES_FAILED = None  # why seg_scores.cu is not used (then _seg_scores serves every segment)
+
+
+def _seg_scores_ext():
+    """The extension, built / loaded once; None when it is not used (as ``_scores_ext``)."""
+    global _SEG_SCORES_EXT, _SEG_SCORES_FAILED
+    if _SEG_SCORES_EXT is None and _SEG_SCORES_FAILED is None:
+        from pathlib import Path
+
+        from tensorfold.cuda.build import load
+
+        try:
+            if not triton_matches_ptx():
+                raise RuntimeError(f"Triton {triton.__version__}: the kernel reproduces Triton {TRITON_PTX}'s PTX")
+            _SEG_SCORES_EXT = load(name="tensorfold_glm_segscores_v1",
+                                   sources=[str(Path(__file__).parent / "seg_scores.cu")],
+                                   extra_cuda_cflags=["-O3"], verbose=False)
+        except Exception as exc:
+            _SEG_SCORES_FAILED = f"{type(exc).__name__}: {(str(exc).strip().splitlines() or [''])[-1][:200]}"
+            print(f"[tensorfold] seg_scores.cu is not used ({_SEG_SCORES_FAILED}); decode windows score with the "
+                  "Triton kernel", flush=True)
+    return _SEG_SCORES_EXT
+
+
+@functools.lru_cache(maxsize=1)
+def _ext_indexer_scores() -> None:
+    """RED-SNOW: both indexer extensions (0105, 0107) built through their loaders, for deploy/redsnow/docker/prebuild.py,
+    which bakes every lru-cached ``_ext*`` loader into the image; without it each container start compiled them
+    again. Nothing calls it while serving (decode.Engine calls the loaders above)."""
+    _scores_ext()
+    _seg_scores_ext()
 
 
 def seg_select_tokens(qi: torch.Tensor, wts: torch.Tensor, pk: torch.Tensor, rows, scratch) -> tuple[torch.Tensor,
@@ -698,19 +927,161 @@ def seg_select_tokens(qi: torch.Tensor, wts: torch.Tensor, pk: torch.Tensor, row
     D = qi.shape[1] // H
     wscale = 1.0 / 5.656854249492381 if H == 32 else H ** -0.5            # select_tokens' constants
     scores = scratch.scores
-    grid = min(SEG_SCORE_GRID, triton.cdiv(scores.shape[1], 64))
     pkv, pks, rs, fp8 = kv8.parts(pk)
+    pools = rows.seg_pools
+    # (RED-SNOW: the kernel's float2 stores need an even score-row stride; SelectScratch's pools are a multiple of
+    # 512 under a shared pool, and an odd one keeps _seg_scores rather than failing the kernel's check)
+    ext = (_seg_scores_ext() if fp8 and H == 32 and D == 128 and scores.stride(0) % 2 == 0 and seg_scores_cuda()
+           else None)
+    if ext is not None:
+        # patch 0107: the segments of SEG_SCORE_CUDA_ROWS or more rows scored by seg_scores.cu (the same stores,
+        # bit for bit), which writes the other segments' pool counts (0 for its own) for _seg_scores below. Its pool
+        # table is sized for any window (MAX_SEGS) at its first use, so it never grows: a captured graph keeps
+        # pointing at live memory
+        pools = getattr(scratch, "seg_scores_pools", None)
+        if pools is None:
+            from .segments import MAX_SEGS
+
+            pools = scratch.seg_scores_pools = torch.zeros((MAX_SEGS,), dtype=torch.int32, device=scores.device)
+        ext.seg_scores(qi, wts, wts.stride(0), pk, rs, scores, scores.stride(0), rows.pos, rows.sparse,
+                       rows.seg_start, rows.seg_rows, rows.seg_pbase, rows.seg_pools, pools, rows.max_segs,
+                       D ** -0.5, wscale, SEG_SCORE_CTAS, SEG_SCORE_STAGES, SEG_SCORE_CUDA_ROWS)
+    grid = min(SEG_SCORE_GRID, triton.cdiv(scores.shape[1], 64))
     _seg_scores[(rows.max_segs, grid)](qi, wts, wts.stride(0), pkv, pks, scores, scores.stride(0), rows.pos,
-                                       rows.sparse, rows.seg_start, rows.seg_rows, rows.seg_pbase, rows.seg_pools,
+                                       rows.sparse, rows.seg_start, rows.seg_rows, rows.seg_pbase, pools,
                                        D ** -0.5, wscale, H=H, HP=max(16, triton.next_power_of_2(H)), D=D, BP=64,
                                        G=grid, RS=rs, FP8=fp8, num_warps=4)
     tokens, counts = scratch.tokens[:R], scratch.counts[:R]
+    if SEG_SPLIT and R >= SEG_FLOOR_ROWS and seg_select_floor() and scratch.split.numel() >= R * 2 * SEG_FLOOR[0]:
+        # patch 0107: one program a row and one pass over its scores (the same tokens and counts, every bit)
+        _seg_select_floor[(R,)](scores, scores.stride(0), rows.pos, rows.sparse, tokens, counts, scratch.split,
+                                W=TOKENS, K=TOPK_POOLS, PL=POOL, CAP=SEG_FLOOR[0], NS=PROMPT_SECTORS,
+                                TARGET=SEG_FLOOR[1], BLOCK=SEG_FLOOR[2], num_warps=SEG_FLOOR[3])
+        return tokens, counts
     if SEG_SPLIT:
         select_split(scores[:R], TOPK_POOLS, scratch=scratch.split, rows=rows, tokens=tokens, counts=counts)
         return tokens, counts
     _seg_select[(R,)](scores, scores.stride(0), rows.pos, rows.sparse, tokens, counts, W=TOKENS, K=TOPK_POOLS,
                       PL=POOL, BLOCK=SEG_SELECT[0], num_warps=SEG_SELECT[1])
     return tokens, counts
+
+
+# ------------------------------------------------------------------------- one-pass segmented selection ---
+# Patch 0107: a decode window's selection with one program a sparse row reading its scores once, patch 0101's prompt
+# selection (_select_floor) for segmented rows: a floor key from a sample of the row (_sample_floor), one pass that
+# compacts the pools at or above it (keys, then pools, in pool order) into CAND, and the radix select over those in
+# registers, writing their tokens as _seg_select does. Every pool above the K-th best is at or above the floor when
+# at least K are (so the K best of the candidates are the row's K best, ties in pool order alike); a row with fewer
+# than K candidates or more than CAP takes _seg_select's own passes over the whole row. The same tokens, tail and
+# count as _seg_select and select_split: integer logic, no order to keep. select_split reads a row's scores five
+# times (four histograms and the output pass: 383 us a call at 4 streams x 8 rows x 596k on GB10, 1.9x the scores
+# kernel's memory time again); with many rows a program a row keeps the GB10 busy, with few select_split's chunk
+# programs do (SEG_FLOOR_ROWS).
+
+@triton.jit
+def _seg_take(TOK, r, take, idx, written, W: tl.constexpr, PL: tl.constexpr):
+    """The tokens of pools idx where take, at slots written + their rank among them (ascending), as _seg_select
+    writes them; returns written + their count."""
+    t = take.to(tl.int32)
+    slot = (written + tl.cumsum(t, 0) - t).to(tl.int64)
+    j = tl.arange(0, PL)
+    tl.store(TOK + r * W + slot[:, None] * PL + j[None, :], (idx.to(tl.int64)[:, None] * PL + j[None, :]).to(tl.int32),
+             mask=take[:, None])
+    return written + tl.sum(t, 0)
+
+
+@triton.jit
+def _seg_select_floor(S, s_stride, POS, SPR, TOK, CNT, CAND, W: tl.constexpr, K: tl.constexpr, PL: tl.constexpr,
+                      CAP: tl.constexpr, NS: tl.constexpr, TARGET: tl.constexpr, BLOCK: tl.constexpr):
+    """Program r (a sparse row): _seg_select's tokens, tail and count from one pass over the row's visible scores
+    (the comment above); a dense row gets count 0. CAND: int32, 2 * CAP a row."""
+
+    r = tl.program_id(0).to(tl.int64)
+    if tl.load(SPR + r) == 0:
+        tl.store(CNT + r, 0)
+        return
+    qpos = tl.load(POS + r).to(tl.int64)
+    NP = (qpos + 1) // PL
+    row = S + r * s_stride
+    c = tl.arange(0, CAP)
+    n = NP
+    ck = CAND + r * (2 * CAP)
+    if NP > CAP:
+        lo = _sample_floor(row, NP, NS, TARGET)
+        n = NP * 0
+        for b in range(0, NP, BLOCK):
+            i = b + tl.arange(0, BLOCK)
+            ok = i < NP
+            u = _order_key(tl.load(row + i, mask=ok, other=0.0))
+            sel = ok & (u >= lo)
+            t = sel.to(tl.int32)
+            m = tl.sum(t, 0)
+            if m > 0:
+                at = n + tl.cumsum(t, 0) - t
+                put = sel & (at < CAP)
+                tl.store(ck + at, u.to(tl.int32, bitcast=True), mask=put)
+                tl.store(ck + CAP + at, i.to(tl.int32), mask=put)
+            n += m
+        tl.debug_barrier()                               # the candidates other threads stored, before reading them
+    if (n >= K) & (n <= CAP):
+        ok = c < n
+        if NP > CAP:
+            u = tl.load(ck + c, mask=ok, other=0).to(tl.uint32, bitcast=True)
+            idx = tl.load(ck + CAP + c, mask=ok, other=0)
+        else:
+            u = _order_key(tl.load(row + c, mask=ok, other=0.0))
+            idx = c
+        prefix = tl.zeros((), dtype=tl.uint32)
+        fixed = tl.zeros((), dtype=tl.uint32)
+        need = K
+        for p in tl.static_range(4):
+            hist = tl.histogram(((u >> (24 - 8 * p)) & 0xFF).to(tl.int32), 256, mask=ok & ((u & fixed) == prefix))
+            need, prefix, fixed = _radix_step(hist, need, prefix, fixed, p)
+        eq = (ok & (u == prefix)).to(tl.int32)
+        take = (ok & (u > prefix)) | ((eq == 1) & (tl.cumsum(eq, 0) - eq < need))
+        _seg_take(TOK, r, take, idx, 0, W, PL)
+    else:                                                # _seg_select's passes over the whole row
+        prefix = tl.zeros((), dtype=tl.uint32)
+        fixed = tl.zeros((), dtype=tl.uint32)
+        need = K
+        for p in tl.static_range(4):
+            hist = tl.zeros((256,), dtype=tl.int32)
+            for b in range(0, NP, BLOCK):
+                i = b + tl.arange(0, BLOCK)
+                ok = i < NP
+                u = _order_key(tl.load(row + i, mask=ok, other=0.0))
+                hist += tl.histogram(((u >> (24 - 8 * p)) & 0xFF).to(tl.int32), 256, mask=ok & ((u & fixed) == prefix))
+            need, prefix, fixed = _radix_step(hist, need, prefix, fixed, p)
+        written = 0
+        equal_seen = 0
+        for b in range(0, NP, BLOCK):
+            i = b + tl.arange(0, BLOCK)
+            ok = i < NP
+            u = _order_key(tl.load(row + i, mask=ok, other=0.0))
+            eq = (ok & (u == prefix)).to(tl.int32)
+            take = (ok & (u > prefix)) | ((eq == 1) & (tl.cumsum(eq, 0) - eq + equal_seen < need))
+            written = _seg_take(TOK, r, take, i, written, W, PL)
+            equal_seen += tl.sum(eq, 0)
+    jt = tl.arange(0, 4)
+    jok = jt < PL - 1
+    tail = NP * PL + jt
+    tok = jok & (tail <= qpos)
+    tl.store(TOK + r * W + K * PL + jt, tl.where(tok, tail, -1).to(tl.int32), mask=jok)
+    cnt = K * PL + tl.sum(tok.to(tl.int64), 0)
+    tl.store(CNT + r, tl.where(NP > K, cnt, 0).to(tl.int32))
+
+
+SEG_FLOOR_ROWS = 8                 # windows of at least this many rows select by _seg_select_floor (speed only)
+SEG_FLOOR = (4096, 2048, 4096, 8)  # its CAP, TARGET, scores a step and warps (speed only: the selection is exact)
+
+
+def seg_select_floor() -> bool:
+    """TF_GLM_SEG_SELECT_FLOOR (default on): windows of SEG_FLOOR_ROWS or more rows select each sparse
+    row's pools by _seg_select_floor (one pass over its scores) instead of select_split (five); the same tokens and
+    counts. 0: select_split. tools/decode_indexer_check.py."""
+    import os
+
+    return os.environ.get("TF_GLM_SEG_SELECT_FLOOR", "1") != "0"
 
 
 # ----------------------------------------------------------------------------------- split top-k selection ---

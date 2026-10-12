@@ -72,16 +72,17 @@ def l2pf_code() -> list[int]:
 
 
 def decode_kernel_code() -> list[int]:
-    """The kernel switches of Mia's 0004/0016/0019 as ints both ranks compare at startup: TF_GLM_HC_DEC,
-    TF_GLM_KDA_WIDE_ROWS, TF_GLM_LATENT_STAGES, TF_GLM_COMBINE_SY, TF_GLM_HC_MMA and TF_GLM_HC_PRE_ROWS. All but
-    HC_MMA give the same bits either way (they choose kernels and launches, not arithmetic); HC_MMA changes prompt
-    rows' bits."""
+    """The kernel switches of Mia's 0004/0016/0019/0090 as ints both ranks compare at startup: TF_GLM_HC_DEC,
+    TF_GLM_KDA_WIDE_ROWS, TF_GLM_LATENT_STAGES, TF_GLM_COMBINE_SY, TF_GLM_HC_MMA, TF_GLM_HC_PRE_ROWS and
+    TF_GLM_EXL3_DEC_ORDER. All but HC_MMA give the same bits either way (they choose kernels and launches, not
+    arithmetic); HC_MMA changes prompt rows' bits."""
 
-    from . import glue, kda, latent
+    from . import exl3_generic, glue, kda, latent
 
     # TF_GLM_HC_MMA does change prompt rows' bits (tensor-core mixing dots): under TF_GLM_HC_SPLIT the ranks must agree
     return [int(glue.hc_dec()), int(kda.WIDE_ROWS), int(latent.chunk_stages()),
-            int(os.environ.get("TF_GLM_COMBINE_SY", "1") != "0"), int(glue.HC_MMA), glue.HC_PRE_ROWS]
+            int(os.environ.get("TF_GLM_COMBINE_SY", "1") != "0"), int(glue.HC_MMA), glue.HC_PRE_ROWS,
+            int(exl3_generic.DEC_ORDER)]
 MTP_ROWS = 8                          # rows an MTP step takes at once (a kept backlog is absorbed in steps of this)
 DENSE_CAPACITY = 2560                 # cache slots while DSA attention stays dense (contexts up to 2,051 tokens)
 # TF_GLM_DRAFT_RING=0: DFlash2's context in a flat buffer of the whole window, not a 2,176-row ring (the same drafts)
@@ -704,7 +705,14 @@ class GlmEngine:
         spare = max(0, min(wanted, plan["budget_bytes"] - plan["total_bytes_estimate"]))
         self.agreed = mine[:1] + mine[2:]     # the spill tier's folders are keyed on these (not the window's slots)
         # TF_GLM_MULTI_DRAFT is compared but keys no folder: it changes no kept state's bits
-        both = self._gather_ints(mine + [draft_code, spare >> 20])
+        # TF_GLM_DRAFT_PRELAUNCH (0100) and TF_GLM_FILL_ROWS are compared too (every rank launches the passes they
+        # decide, and the fill rows' timing passes all-gather) but key no folder: they change no kept state's bits
+        ahead = rows_fill = 0
+        if parallel > 1:
+            from .multi import PRELAUNCH, fill_rows
+
+            ahead, rows_fill = int(PRELAUNCH), fill_rows(prefill_rows, grid=self.grid)
+        both = self._gather_ints(mine + [draft_code, ahead, rows_fill, spare >> 20])
         if both[0][:-1] != both[1][:-1]:
             raise RuntimeError("the two ranks were started with different settings (draft model, context, drafts, "
                                "TF_GLM_LATENT, TF_GLM_MTP, TF_GLM_DRAFT_RING, --parallel, TF_GLM_MULTI_VERIFY, "
@@ -713,9 +721,9 @@ class GlmEngine:
                                "TF_GLM_FILL_BUDGET_MS, TF_GLM_KDA_CHUNKED, TF_GLM_HC_SPLIT*, TF_GLM_PREFILL_OVERLAP, "
                                "TF_GLM_OVERLAP_PIECES, TF_GLM_HC_EXCHANGE, TF_GLM_COPY_*, TF_GLM_DRAFT_DUMP, "
                                "TF_GLM_MAX_ROWS, TF_GLM_WIDE_GRAPHS, TF_GLM_HC_DEC, TF_GLM_KDA_WIDE_ROWS, "
-                               "TF_GLM_LATENT_STAGES, TF_GLM_COMBINE_SY, TF_GLM_HC_MMA, TF_GLM_L2PF*, "
+                               "TF_GLM_LATENT_STAGES, TF_GLM_COMBINE_SY, TF_GLM_HC_MMA, TF_GLM_EXL3_DEC_ORDER, TF_GLM_L2PF*, "
                                "TF_GLM_MULTI_SAMPLER / _DEPTH / _OVERHEAD_MS / _ASYNC / _LONE / _PROFILE / _DRAFT, "
-                               "TENSORFOLD_NUCLEUS_UNION): "
+                               "TENSORFOLD_NUCLEUS_UNION, TF_GLM_DRAFT_PRELAUNCH, TF_GLM_FILL_ROWS): "
                                f"rank 0 {both[0][:-1]}, rank 1 {both[1][:-1]}; pull the draft model on both machines "
                                "(or pass --drafter none to both) and give both the same flags")
         self.cache_bytes = min(both[0][-1], both[1][-1]) << 20

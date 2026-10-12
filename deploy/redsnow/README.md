@@ -137,8 +137,11 @@ Set these in `deploy/redsnow/.env` or in the environment. Defaults are in `start
 | `VISION`, `VISION_URLS` | 1, 0 | Image and video input (rank 0 runs the vision tower, ~2 GiB); https image URLs. |
 | `COMM`, `ROCE_MAX_KB`, `ROCE_WAIT_S` | roce, 512, 300 | Small all-gathers as one-shot RDMA writes (b12x's transport), larger ones over NCCL. `nccl`: all over NCCL. Same bits. |
 | `COPY`, `COPY_MAX`, `DRAFT_POLICY`, `COPY_CODE` | 1, 15, `fnc7:0.3`, 1 | Prompt-lookup ("copy") drafts ahead of DFlash2's, up to 7 DFlash2 drafts cut at noisy chance 0.3, 16-row verify graphs. Drafts change speed, not replies. |
-| `SPLIT`, `KDA_CHUNKED`, `MULTI_PREFILL`, `FILL_BUDGET_MS`, `FILL_DRAFTS`, `STREAM_SMOOTH` | 1, 1, 1, 200, 1, 1 | Prefill: glue split by rows and overlapped, chunked KDA, shared prompt chunks, prompt slices between decode rounds, steadier streamed pacing. |
+| `SPLIT`, `KDA_CHUNKED`, `MULTI_PREFILL`, `FILL_BUDGET_MS`, `FILL_DRAFTS`, `FILL_ROWS`, `STREAM_SMOOTH` | 1, 1, 1, 200, 1, 2048, 1 | Prefill: glue split by rows and overlapped, chunked KDA, shared prompt chunks, prompt slices between decode rounds, a new prompt filled in whole 2,048-row chunks while others decode (the same memory and replies), steadier streamed pacing. |
 | `L2PF`, `SHARED_PREFIX`, `MULTI_LONE` | 1, 1, 0 | L2 prefetch in decode; kept state at the end of a shared system prompt; lone-request graphs (off: they evict kept prompts). |
+| `EXL3_DEC_ORDER` | 2 | Launch order of the expert decode kernel's blocks (MiaAI-Lab 0090, by Lukasz Raczylo): `1` and `2` group the blocks of one k slice (2 measured 0.4–1.2% faster in drafted decode); `0` is the old order. The same replies for every value; both ranks must agree (checked at start). |
+| `TF_GLM_QMM_CLUSTERS` | unset | Passed through. `1` restores the cluster reduction for small 4-bit decode matmuls (MiaAI-Lab 0103, by BadAd84). In RED-SNOW only the DFlash2 drafter's matmuls are 4-bit; the default is faster there and gives the same bits. |
+| `TF_GLM_DRAFT_PRELAUNCH` | unset (on) | Passed through. `0` turns off launching the next DFlash2 block pass at a decode round's end (MiaAI-Lab 0100, by BadAd84). The same replies either way; both ranks must agree (checked at start). |
 | `SPILL_GIB` (+ `SPILL_DIR`, ...) | 0 (off) | Kept prompt states on local disk. Off by default; see `start.sh` for its settings. |
 | `MTP_HEAD`, `NCCL_CHANNELS`, `MASTER_PORT` | auto, 4, 29551 | |
 | `WAIT_TIMEOUT`, `STOP_TIMEOUT`, `SMOKE`, `MIN_GIB` | 3600, 30, 1, 110 | |

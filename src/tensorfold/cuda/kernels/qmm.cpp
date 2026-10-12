@@ -1,7 +1,7 @@
 #include <torch/extension.h>
 #include <c10/cuda/CUDAGuard.h>
 
-bool qmm_clusters(int, bool);
+bool qmm_clusters(int, bool, long long, long long, long long);
 void qmm_cuda(const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&,
               at::Tensor&, const at::Tensor&, int, int, int, int, bool, bool);
 void qmm_group_cuda(const at::Tensor&, const at::Tensor&, const std::vector<at::Tensor>&,
@@ -38,7 +38,7 @@ void qmm(const at::Tensor& x, const at::Tensor& xs, const at::Tensor& w, const a
                 out.scalar_type() == (f32 ? at::kFloat : at::kBFloat16), "out: (M, n)");
     c10::cuda::CUDAGuard guard(x.device());
     at::Tensor p;
-    if (sk > 1 && !qmm_clusters(static_cast<int>(sk), reduce)) {
+    if (sk > 1 && !qmm_clusters(static_cast<int>(sk), reduce, m, n, k)) {
         p = part.has_value() ? *part : at::empty({sk, m, n}, x.options().dtype(at::kFloat));
         TORCH_CHECK(p.is_cuda() && p.is_contiguous() && p.scalar_type() == at::kFloat && p.numel() >= sk * m * n,
                     "part: at least (SK, M, n) fp32");
@@ -148,8 +148,14 @@ void qmm_prefill8w(const at::Tensor& x8, const at::Tensor& a, const at::Tensor& 
                        l64);
 }
 
+// Whether ``qmm`` reduces sk K slices of an (m rows, n x k weight) call in a cluster (else the partials buffer).
+bool clusters(int64_t sk, bool reduce, int64_t m, int64_t n, int64_t k) {
+    return qmm_clusters(static_cast<int>(sk), reduce, m, n, k);
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("qmm", &qmm);
+    m.def("clusters", &clusters);
     m.def("qmm_group", &qmm_group);
     m.def("qmm_prefill", &qmm_prefill);
     m.def("qmm_prefill8", &qmm_prefill8);

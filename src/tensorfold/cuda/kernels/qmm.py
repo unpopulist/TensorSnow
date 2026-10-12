@@ -18,7 +18,7 @@ def _ext():
     from tensorfold.cuda.build import load
 
     here = Path(__file__).parent
-    return load(name="tensorfold_qmm_v5", sources=[str(here / "qmm.cpp"), str(here / "qmm.cu"),
+    return load(name="tensorfold_qmm_v6", sources=[str(here / "qmm.cpp"), str(here / "qmm.cu"),
                                                    str(here / "qmm_group.cu"), str(here / "qmm_prefill.cu"),
                                                    str(here / "qmm_prefill8.cu")],
                 extra_cuda_cflags=["-O3"], verbose=False)
@@ -168,7 +168,9 @@ def matmul(x: torch.Tensor, q: Q4, xs: torch.Tensor | None = None, *, sk: int | 
     sk = sk or split_k(q.n, q.k, q.gs)
     if out is None:
         out = torch.empty((m, q.n), dtype=torch.float32 if f32 else torch.bfloat16, device=x.device)
-    if q.gs == 64 and reduce and grouped(x.device.index):
+    # Mia's 0103: a decode window (<= 64 rows) on a weight under 28 Mi values reduces its K slices through the partials
+    # buffer (qmm.cu), not the grouped kernel's cluster; the same bits. TF_GLM_QMM_CLUSTERS=1: always the cluster.
+    if q.gs == 64 and reduce and grouped(x.device.index) and (sk == 1 or _ext().clusters(sk, True, m, q.n, q.k)):
         _ext().qmm_group(x, xs, [q.weight], [q.scales], [q.biases], [out], [q.n], [sk], f32,
                          group_tile(m, *_chip(x.device.index)), -1)
         return out

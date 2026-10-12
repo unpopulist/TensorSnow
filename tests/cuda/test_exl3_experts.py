@@ -469,3 +469,23 @@ def test_fused_down_epilogue_equals_the_separate_launch(monkeypatch):
         ys.append(experts.routed(x, sel, None, ex, s, None, ROWS, act_mode=experts.ACT_BF16).clone())
     live = (sel < E).view(-1)
     assert torch.equal(ys[0][live], ys[1][live])
+
+
+def test_decode_launch_orders_keep_the_bits():
+    """TF_GLM_EXL3_DEC_ORDER (Mia's 0090): launch orders 1 and 2 of the decode kernel give order 0's bits, through
+    gate/up (two matrices, four splits) and the fused down projection."""
+
+    from tensorfold.cuda.exl3 import experts
+
+    E, D, I, TOPK, ROWS = 16, 1024, 512, 4, 8
+    ex, _ = _layer(E, D, I, [(10, 12, (8, 12)[e % 2]) for e in range(E)], 2, seed=5)
+    g = torch.Generator().manual_seed(2)
+    x = torch.randn((ROWS, D), generator=g).to(torch.bfloat16).cuda()
+    sel, _ = _picks(E, ROWS, TOPK, g, shared=True)
+    s = experts.Scratch(ex, ROWS, TOPK + 1, prompt_rows=ROWS + 1)   # the decode kernel at every row count
+    live = (sel < E).view(-1)
+    ys = [experts.routed(x, sel, None, ex, s, None, ROWS, act_mode=experts.ACT_BF16, order=o).clone()
+          for o in (0, 1, 2)]
+    assert torch.isfinite(ys[0][live]).all()
+    for o in (1, 2):
+        assert torch.equal(ys[o][live].view(torch.int32), ys[0][live].view(torch.int32)), o

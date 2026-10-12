@@ -186,3 +186,21 @@ Apache License 2.0:
 
 The b12x RoCE transport used by `TF_COMM_BACKEND=roce` is credited in the section above.
 See [the license text](LICENSES/Apache-2.0.txt).
+
+## MiaAI-Lab recipe patches 0090, 0099–0107 and `FILL_ROWS`
+
+These changes are ports of patches in MiaAI-Lab's
+[GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold)
+(Apache License 2.0), adapted to this tree. Credit goes to their authors:
+
+- `0090-glm-expert-launch-order` (`TF_GLM_EXL3_DEC_ORDER`, the launch order of the EXL3 expert decode kernel's
+  blocks): by Lukasz Raczylo ([lukaszraczylo](https://github.com/lukaszraczylo)), in
+  [PR #95](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold/pull/95).
+- `0099-glm-tokenize-nogil` (prompts tokenized with Python's GIL released), `0100-glm-draft-prelaunch` (the next
+  DFlash2 block pass launched at a decode round's end), `0101-glm-prompt-select-floor` (a prompt chunk's pool
+  selection in one pass), `0103-glm-qmm-decode-noclusters` (decode 4-bit matmuls without clusters at few rows),
+  `0105-glm-prompt-scores-cuda` (a prompt chunk's indexer scoring in CUDA), `0107-glm-decode-indexer` (a decode
+  window's indexer scoring in CUDA and selection in one pass), and the `FILL_ROWS=2048` launcher default: by
+  [BadAd84](https://github.com/BadAd84).
+
+See [the license text](LICENSES/Apache-2.0.txt).

@@ -83,6 +83,10 @@ MAX_WINDOW = 32                          # rows of every stream's windows togeth
 
 
 # -- settings ------------------------------------------------------------------------------------------------------
+# TF_GLM_DRAFT_PRELAUNCH (Mia's 0100, by BadAd84; default 1, 0 off, the same drafts and replies either way): a round's
+# end launches the next round's DFlash2 block pass (``MultiDecoder._prelaunch``). Ranks that disagree would launch
+# different collectives, so it is read once here and checked equal on both ranks at startup (``GlmEngine``)
+PRELAUNCH = os.environ.get("TF_GLM_DRAFT_PRELAUNCH", "1").strip() != "0"
 TRACE = os.environ.get("TF_GLM_TRACE_GATHERS", "") == "1"   # debug: each round's draft lengths and sampler layout
 
 
@@ -400,6 +404,7 @@ class Lane:
     images: bool = False               # both ranks: the prompt has pictures (its kept states are told apart by key)
     feed: Any = None                   # an image prompt's feature rows (``engine.VisionFeed``; rank 1 gets them per chunk)
     copies: Any = None                 # TF_GLM_COPY_DRAFTS: ``copy_drafts.CopyDrafts`` over prompt and reply (Mia's 0007)
+    next_copy: Any = None              # ((copies length, room), proposal, proposed) the round's end worked out (0100)
     chat: int = 0                      # the conversation this stream belongs to (its kept states are capped together)
     decoding: bool = False
     paused: bool = False
@@ -451,6 +456,7 @@ class MultiDecoder:
     kept_bytes_cap = 0                  # TF_GLM_KEPT_BYTES_GIB in bytes (0: off; set by __init__)
     next_chat = 0                       # the last conversation id given out (``_admitted``)
     drafts = None                       # TF_GLM_MULTI_DRAFT=batched: the ``dflash2_multi.MultiDrafter`` (set by __init__)
+    prelaunch = PRELAUNCH               # TF_GLM_DRAFT_PRELAUNCH (0100): the next block pass from a round's end
 
     def __init__(self, engine, streams: int, *, verify=None, contexts=None, draft_graphs: bool | None = None,
                  tune: MultiSettings | None = None, row_ms: Sequence[float] | None = None) -> None:
@@ -2101,7 +2107,7 @@ class MultiDecoder:
                 l.copies = CopyDrafts(list(l.s.prompt) + list(l.s.out), c.match, c.most, prompt=len(l.s.prompt),
                                       reply_match=c.reply_match, miss_most=c.miss_most)
             if l.copies is not None and not short:     # copy drafts first (Mia's 0007), else DFlash2's
-                d = list(l.copies.propose(l.s.count - len(l.s.out) - 1))     # decode.copy_room
+                d = self._copy_proposal(l)
             copied.append(bool(d))
             if not d and not short and l.dflash and l.depth > 0:
                 if tune.depth == "joint":
@@ -2203,10 +2209,58 @@ class MultiDecoder:
             elif l.policy is not None:                     # a copy round leaves the DFlash2 policy where it was
                 l.depth = min(l.policy.next(*((0, 0) if was_copy else (ndrafts, keep - 1))),
                               max(0, s.count - len(s.out)))
+        if not short and self.prelaunch and self.drafts is not None:
+            self._prelaunch(lanes)
         if prof is not None:
             prof.mark("emit")
             prof.end(len(lanes), sum(len(g.tokens) for g in segments), sum(keeps),
                      sum(len(g.tokens) - 1 for g in segments))
+
+    @staticmethod
+    def _copy_room(l: Lane) -> int:
+        return l.s.count - len(l.s.out) - 1                 # decode.copy_room
+
+    def _copy_proposal(self, l: Lane) -> list[int]:
+        """``l.copies.propose`` with this round's room. The previous round's end may have worked it out already
+        (``_prelaunch``); with the copies unchanged since (the same length and room) its proposal and ``proposed``
+        are this call's (``propose`` reads only the copies' tokens, ``missed`` and the room)."""
+
+        room = self._copy_room(l)
+        hit, l.next_copy = l.next_copy, None
+        if hit is not None and hit[0] == (l.copies.length, room):
+            l.copies.proposed = hit[2]
+            return list(hit[1])
+        return list(l.copies.propose(room))
+
+    def _prelaunch(self, lanes: list[Lane]) -> None:
+        """Both ranks, at the end of a round that was not short (Mia's 0100, by BadAd84): the batched DFlash2 block
+        pass of the streams that will ask for drafts next round if nothing changes (``MultiDrafter.prelaunch``), so it
+        runs while rank 0 finishes the round and sends the next message instead of after. Only state every rank holds
+        decides it (the round's streams, their tokens, depths and copies, their contexts' ends) - not ``Stream.done``,
+        which rank 0's emit sets alone (a stop string, a cancelled client) - so every rank launches the same pass and
+        its all-gather pairs up. A next round that differs (a stream left, joined, paused or moved, a short round,
+        copied drafts, a fill's taps) runs its own pass; the drafts are the same either way."""
+
+        reqs = []
+        block = self.drafts.block
+        for l in lanes:
+            s = l.s
+            if not l.dflash or l.depth <= 0 or not s.out or len(s.out) >= s.count or s.out[-1] in self._ends(l):
+                continue
+            ctx = self._ctx(l)
+            if min(l.depth, block - 1) < 1 or ctx.context_end <= 0:
+                continue
+            if l.copies is not None:            # next round's copy drafts come first: worked out once, here
+                room = self._copy_room(l)
+                before = l.copies.proposed
+                c = list(l.copies.propose(room))
+                l.next_copy = ((l.copies.length, room), c, l.copies.proposed)
+                l.copies.proposed = before      # settled by extend as before (a short round proposes nothing)
+                if c:
+                    continue
+            reqs.append((ctx, s.out[-1]))
+        if reqs:
+            self.drafts.prelaunch(reqs)
 
     def _joint(self, lanes: list[Lane], drafts: list[list[int]], asks: list[int]) -> None:
         """TF_GLM_MULTI_DEPTH=joint (Mia's 0035, here over the per-slot contexts): every asking stream's chain walked

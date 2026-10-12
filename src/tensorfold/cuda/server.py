@@ -195,7 +195,7 @@ class App:
                 raise DecisionError(f"the chat template failed: {exc}") from exc
 
         def encode(text: str) -> list[int]:
-            return [int(token) for token in self.tok.encode(text, add_special_tokens=False).ids]
+            return [int(token) for token in self._encode_ids(text, False)]
 
         try:
             prepared = prompts_for(body, render, encode, context_len=self.effective_context_window)
@@ -295,14 +295,14 @@ class App:
                                        self.sampling_for(body, rendered.tokens), ignore_eos=ignore_eos, stop=stop,
                                        vision=rendered.vision, grammar=compiled, think_budget=budget)
             text = render(body["messages"])
-            prompt = self.tok.encode(text, add_special_tokens=False).ids
+            prompt = self._encode_ids(text, False)
         elif isinstance(body.get("prompt"), list):       # token ids (vLLM's and OpenAI's form): served as given
             prompt = self.token_ids(body["prompt"])
         else:
             text = body.get("prompt")
             if not isinstance(text, str):
                 raise RequestError("prompt must be a string or a list of token ids")
-            prompt = self.tok.encode(text, add_special_tokens=flag(body, "add_special_tokens", False)).ids
+            prompt = self._encode_ids(text, flag(body, "add_special_tokens", False))
         if not prompt:
             raise RequestError("rendered prompt is empty")
         # sampling is resolved here, so a malformed control is refused before a stream opens
@@ -315,6 +315,19 @@ class App:
 
         size = getattr(self.tok, "get_vocab_size", None)
         return token_ids(value, size(with_added_tokens=True) if size is not None else None, field)
+
+    def _encode_ids(self, text: str, special: bool) -> list[int]:
+        """``self.tok.encode(text, add_special_tokens=special).ids``, the same ids, through the batch call (patch 0099):
+        it tokenizes with Python's GIL released (``encode`` holds it, ~1.2 us a token: a 600k-token prompt stopped the
+        engine loop, and every other stream, for ~0.8 s at each request's start) and skips the character offsets
+        nothing here reads (~30% faster). Every tokenizer call in this server goes through here: the chat, prompt and
+        Anthropic routes (count_tokens included, through ``prepare``), /tokenize, /decisions, the forced think close
+        and the tool-call gate. A stand-in without ``encode_batch_fast`` (the tests' tokenizers) is asked ``encode``."""
+
+        fast = getattr(self.tok, "encode_batch_fast", None)
+        if fast is None:
+            return self.tok.encode(text, add_special_tokens=special).ids
+        return fast([text], add_special_tokens=special)[0].ids
 
     def tokenize(self, body: dict[str, Any]) -> dict[str, Any]:
         """vLLM's ``/tokenize`` (``server.token_routes``): a prompt's ids (``add_special_tokens``, default true, as
@@ -337,7 +350,7 @@ class App:
             text = body.get("prompt")
             if not isinstance(text, str):
                 raise RequestError("prompt must be a string (or send messages)")
-            ids = self.tok.encode(text, add_special_tokens=flag(body, "add_special_tokens", True)).ids
+            ids = self._encode_ids(text, flag(body, "add_special_tokens", True))
         limit = self._context_limit()
         reply: dict[str, Any] = {"count": len(ids), "tokens": [int(t) for t in ids],
                                  "max_model_len": limit if limit is not None else self.native_context_window}
@@ -721,9 +734,9 @@ class App:
 
         if think_end is None:
             return []
-        close = [*self.tok.encode("\n", add_special_tokens=False).ids, think_end]
+        close = [*self._encode_ids("\n", False), think_end]
         if prepared.grammar is None:
-            close += self.tok.encode("\n\n", add_special_tokens=False).ids
+            close += self._encode_ids("\n\n", False)
         return close
 
     def _glm_calls(self) -> bool:
@@ -762,7 +775,7 @@ class App:
         names = [str((t.get("function") or t).get("name") or "") for t in tools] if lead is not None else []
         return CallGate.after_prompt(prompt, self.tok.token_to_id(opener), blank, think_open=think[0],
                                      think_end=think[1], text=text, lead=lead or "", names=names, tail=tail or "",
-                                     encode=lambda t: list(self.tok.encode(t, add_special_tokens=False).ids))
+                                     encode=lambda t: list(self._encode_ids(t, False)))
 
 
 def loop_guard_enabled() -> bool:

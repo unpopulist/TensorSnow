@@ -56,7 +56,9 @@ def layers():
 
 def test_sixteen_byte_loads_keep_the_bits(layers, monkeypatch):
     from tensorfold.cuda.exl3 import experts
+    from tensorfold.families.glm5_next.cuda.exl3_generic import dec_order
 
+    order = dec_order()                                         # TF_GLM_EXL3_DEC_ORDER (0090): the same bits at each
     rng = np.random.default_rng(7)
     g = torch.Generator(device="cuda").manual_seed(3)
     for i, ex in layers.items():
@@ -70,7 +72,8 @@ def test_sixteen_byte_loads_keep_the_bits(layers, monkeypatch):
             def run(loads, s, rows=slice(None)):
                 monkeypatch.setattr(experts, "LOADS", loads)
                 xr, pr = x[rows].contiguous(), pick[rows].contiguous()
-                y = experts.routed(xr, pr, None, ex, s, None, xr.shape[0], 10.0, act_mode=experts.ACT_BF16)
+                y = experts.routed(xr, pr, None, ex, s, None, xr.shape[0], 10.0, act_mode=experts.ACT_BF16,
+                                   order=order)
                 return y[:xr.shape[0] * SLOTS].clone()
 
             new = run(1, dec)[live]

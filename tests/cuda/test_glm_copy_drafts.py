@@ -1,6 +1,6 @@
 """Copy drafts (Mia's 0007, TF_GLM_COPY_DRAFTS=1) on the tiny synthetic GLM: they only propose, so a drafted reply
 equals the serial (draft=False) reply token for token, alone (MTP / DFlash2 decode) and under --parallel 3 beside
-streams that copy less. The tiny random model never repeats 2 tokens, so the tests then match 1 token (set on the
+streams that copy less (with the next block pass launched at each round's end, 0100). The tiny random model never repeats 2 tokens, so the tests then match 1 token (set on the
 engine; the env allows 2 and up): proposals really fire, and verification decides."""
 
 from __future__ import annotations
@@ -76,5 +76,9 @@ def test_parallel_streams_with_copies_equal_their_solo_replies(models, plain, ve
         got, stats = _concurrent(multi, jobs)
         assert got == want
         assert all(st.get("copy_rounds", 0) > 0 for st in stats), stats
+        # TF_GLM_DRAFT_PRELAUNCH (0100, on by default): rounds took the block pass the previous round's end launched,
+        # and the replies are still the solo ones
+        ahead = multi.multi.drafts.ahead
+        assert (ahead[0] > 0 and ahead[1] > 0) if multi.multi.prelaunch else ahead == [0, 0], ahead
     finally:
         multi.scheduler.close()

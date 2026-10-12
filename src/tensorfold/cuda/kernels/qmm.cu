@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <ATen/cuda/CUDAContext.h>
 #include <cooperative_groups.h>
+#include <cstdlib>
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 
@@ -278,15 +279,31 @@ void dispatch(int bm, const at::Tensor& x, const at::Tensor& xs, const at::Tenso
 } // namespace
 
 // Clusters hold up to 8 K slices (the portable size) from sm_90; more, unreduced slices or older GPUs use the buffer.
-bool qmm_clusters(int SK, bool reduce) {
-    return SK > 1 && SK <= 8 && reduce && at::cuda::getCurrentDeviceProperties()->major >= 9;
+// Mia's 0103 (by BadAd84): windows of up to CLUSTER_ROWS rows also use the buffer (and reduce_kernel) unless the
+// weight holds at least CLUSTER_VALUES values. The same sums in the same order (slice 0 + slice 1 + ... in fp32, then
+// one rounding), so the same bits. Her GB10 measurements: the cluster launch and its two cluster.sync cost 20-60% on
+// the latency-bound decode matrices up to ~25 Mi values, while from 32 Mi the clusters mostly win; 28 Mi sits between.
+// TF_GLM_QMM_CLUSTERS=1: clusters for every reduced K split, the rule before. Prompt chunks (more rows) are unchanged.
+// qmm.py's ``matmul`` asks this rule (``clusters``) before it takes the grouped sm_12x kernel, which always clusters.
+constexpr long long CLUSTER_ROWS = 64;
+constexpr long long CLUSTER_VALUES = 28LL << 20;
+static bool clusters_always() {
+    static const bool always = [] {
+        const char* v = std::getenv("TF_GLM_QMM_CLUSTERS");
+        return v != nullptr && v[0] == '1' && v[1] == '\0';
+    }();
+    return always;
+}
+bool qmm_clusters(int SK, bool reduce, long long M, long long N, long long K) {
+    return SK > 1 && SK <= 8 && reduce && at::cuda::getCurrentDeviceProperties()->major >= 9 &&
+           (clusters_always() || M > CLUSTER_ROWS || N * K >= CLUSTER_VALUES);
 }
 
 void qmm_cuda(const at::Tensor& x, const at::Tensor& xs, const at::Tensor& w, const at::Tensor& scales,
               const at::Tensor& biases, at::Tensor& out, const at::Tensor& part, int N, int SK, int gs, int bm,
               bool f32, bool reduce) {
     const int M = x.size(0);
-    const bool cluster = qmm_clusters(SK, reduce);
+    const bool cluster = qmm_clusters(SK, reduce, M, N, x.size(1));
 #define GO(G, F, C) dispatch<G, F, C>(bm, x, xs, w, scales, biases, out, part, N, SK)
     if (gs == 64) {
         if (f32) { if (cluster) GO(64, true, true); else GO(64, true, false); }

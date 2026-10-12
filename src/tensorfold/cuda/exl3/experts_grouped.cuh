@@ -264,20 +264,31 @@ __host__ __device__ constexpr bool k2_supported(int k2) {
 // LD16: the trellis words through warp_tiles_v4 (16-byte loads, the same words, chains and sums).
 // FUSE (down, SK = 1, NT * 16 = 128 columns: one Hadamard block, after Mia's 0016): the down epilogue's arithmetic on
 // the block's own sums (v = 0 + the warps' sum), Y written directly, no Z round trip and no epilogue launch.
+// SWZ (TF_GLM_EXL3_DEC_ORDER, after Mia's 0090 by Lukasz Raczylo): the launch order of the programs only, so the same
+// bits. 0: as launched (experts fastest); 1 / 2: the linear block id's n blocks fastest, so the column blocks of one
+// expert's k slice run together and read contiguous trellis rows, then the experts (1) or the matrices, splits and
+// member tiles (2). A kernel argument, not a template parameter: one uniform branch a block, no extra instances.
 template <int CB, int NT, int W, int PF, int LO, int HI, bool FUSE = false, bool LD16 = false>
 __global__ void __launch_bounds__(W * 32) grouped_kernel(
     const half* __restrict__ X0, const half* __restrict__ X1, const int64_t* __restrict__ TP0,
     const int64_t* __restrict__ TP1, const int* __restrict__ K2_0, const int* __restrict__ K2_1,
     const int* __restrict__ uids, const int* __restrict__ ucount, const int* __restrict__ members,
     float* __restrict__ Z, int K, int N, int P, int SK, int maxm, int slots, const half* __restrict__ svh_d = nullptr,
-    float* __restrict__ Y = nullptr) {
+    float* __restrict__ Y = nullptr, int swz = 0) {
     static_assert(!FUSE || NT * 16 == 128, "the fused down epilogue needs one 128-column block a program");
-    const int u = blockIdx.x;
+    int u = blockIdx.x, nblock = blockIdx.y, zz = blockIdx.z;
+    if (swz != 0) {
+        const unsigned lid = blockIdx.x + gridDim.x * (blockIdx.y + gridDim.y * blockIdx.z);
+        nblock = (int)(lid % gridDim.y);
+        const unsigned r = lid / gridDim.y;
+        if (swz == 1) { u = (int)(r % gridDim.x); zz = (int)(r / gridDim.x); }
+        else { zz = (int)(r % gridDim.z); u = (int)(r / gridDim.z); }
+    }
     if (u >= ucount[0]) return;
     const int MT = (maxm + 15) / 16;
-    const int mtile = blockIdx.z % MT;
-    const int split = (blockIdx.z / MT) % SK;
-    const int mat = blockIdx.z / MT / SK;
+    const int mtile = zz % MT;
+    const int split = (zz / MT) % SK;
+    const int mat = zz / MT / SK;
     const half* X = mat ? X1 : X0;
     const int e = uids[u];
     const uint32_t* T = reinterpret_cast<const uint32_t*>(mat ? TP1[e] : TP0[e]);
@@ -300,7 +311,7 @@ __global__ void __launch_bounds__(W * 32) grouped_kernel(
 
     const int per_split = KT / SK, per_warp = per_split / W;
     const int kt0 = split * per_split + warp * per_warp;
-    const int nt0 = blockIdx.y * NT;
+    const int nt0 = nblock * NT;
 
     // warps' partial sums through shared memory, added in warp order; under LD16 each warp's slice is first its
     // staging area (NT * TW <= 16 * NT * 16 words)
@@ -419,6 +430,7 @@ struct GroupedArgs {
     int nexp_max;        // grid.x (upper bound of distinct experts)
     int mats, nt, warps, pf, lo, hi;
     int ld;              // 1: 16-byte trellis loads (warp_tiles_v4; every trellis 16-byte aligned)
+    int swz;             // the programs' launch order (grouped_kernel's SWZ): 0, 1 or 2, the same bits
     const half* svh_d;   // non-null: the fused down epilogue into y
     float* y;
 };
@@ -432,11 +444,11 @@ void grouped_launch(const GroupedArgs& a, cudaStream_t stream) {
     if (a.svh_d && NT_ * 16 == 128)                                                                             \
         grouped_kernel<CB, NT_, W_, PF_, LO_, HI_, NT_ * 16 == 128, LD_><<<grid, W_ * 32, 0, stream>>>(         \
             a.x0, a.x1, a.tp0, a.tp1, a.k2_0, a.k2_1, a.uids, a.ucount, a.members, a.z, a.K, a.N, a.P, a.SK,    \
-            a.maxm, a.slots, a.svh_d, a.y);                                                                     \
+            a.maxm, a.slots, a.svh_d, a.y, a.swz);                                                              \
     else                                                                                                        \
         grouped_kernel<CB, NT_, W_, PF_, LO_, HI_, false, LD_><<<grid, W_ * 32, 0, stream>>>(                   \
             a.x0, a.x1, a.tp0, a.tp1, a.k2_0, a.k2_1, a.uids, a.ucount, a.members, a.z, a.K, a.N, a.P, a.SK,    \
-            a.maxm, a.slots);                                                                                   \
+            a.maxm, a.slots, nullptr, nullptr, a.swz);                                                          \
     } while (0)
 #define TF_LAUNCH(NT_, W_, PF_, LO_, HI_)                                                                       \
     do {                                                                                                        \
