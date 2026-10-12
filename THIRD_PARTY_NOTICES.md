@@ -139,6 +139,12 @@ a patch series against TensorFold v0.6.0, Copyright 2026 MiaAI-Lab, Apache Licen
 patch a change comes from ("Mia's 0038" is that series' patch 0038). The ported patches include parts contributed to
 that project by others, credited there and here:
 
+- 0003 (GLM's image and video processors and vision tower): checked bit for bit against Hugging Face
+  [transformers](https://github.com/huggingface/transformers) 5.17 (Apache-2.0), the reference they follow.
+- 0013 (verify windows of up to 16 rows, so copy drafts can run long): after the wider copy windows proposed in
+  [TensorFold PR #115](https://github.com/ashhart/TensorFold/pull/115) by Ash Hart.
+- 0043 (decode scoring and split selection bounded to the pools a row can see): the idea follows
+  [TensorFold PR #140](https://github.com/ashhart/TensorFold/pull/140) by [mikolaj92](https://github.com/mikolaj92).
 - 0054 (image prompts resume from kept prompt states): [abhicnv007](https://github.com/abhicnv007).
 - 0063 (kept-prompt cap drops superseded states first): [Alexbob0](https://github.com/Alexbob0), pull request #32.
 - 0071 (shared-prefix copy), 0072 (display reservation in the pool; the technique proposed by
@@ -149,8 +155,8 @@ that project by others, credited there and here:
 - 0078 (take-over decides, then copies): [m-naoki-m](https://github.com/m-naoki-m).
 - 0079 (picture cache), 0080 (quoted vision markers) and 0089 (kept-state budgets):
   [ThomasWadeZ](https://github.com/ThomasWadeZ).
-- 0082 / 0083 (admission cap, delivery abort): [johnwhited](https://github.com/johnwhited), following vLLM's
-  (Apache-2.0) admission and abort behaviour as a reference.
+- 0081 / 0082 / 0083 (capacity status, admission cap, delivery abort): [johnwhited](https://github.com/johnwhited),
+  following vLLM's (Apache-2.0) admission and abort behaviour as a reference.
 - 0085 / 0086 (split selection and prompt scoring loops) and 0087 (display reservation through an external lender;
   nothing of that lender ships here): [BadAd84](https://github.com/BadAd84).
 - 0088 (spill tier, `src/tensorfold/cuda/spill.py`): Robert Wojciechowski ([wojo](https://github.com/wojo)); its
